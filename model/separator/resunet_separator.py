@@ -1,37 +1,36 @@
-"""ResUNet separator backbone for the ASD source-separation proxy.
+"""Extended ResUNet separator backbone for the ASD source-separation proxy.
 
-This module defines the first separator backbone used in the new proxy-task
-pipeline:
+This version keeps the original lightweight ResUNet path intact, but adds the
+main hooks needed for the DCASE 2025 Task 4 2nd-place team's ideas:
 
-    mixture spectrogram -> ResUNet -> predicted target spectrogram
+1. bottleneck-side hidden-state injection
+2. bottleneck / decoder Time-FiLM conditioning
+3. optional DPRNN after the bottleneck
+4. a helper for partial external pretrained loading
 
-Design goals
-------------
-1. Be directly compatible with ``model/separator/frontend.py`` where the input
-   is typically a single-channel spectrogram with shape ``[B, 1, F, T]``.
-2. Reuse the low-level blocks from ``model/separator/resunet_blocks.py``.
-3. Expose intermediate feature maps that can later be pooled/concatenated into
-   ASD embeddings.
-4. Support two practical output modes for the MVP:
-   - ``mask``  : predict a ratio mask and multiply it with the input mixture
-   - ``direct``: directly predict the target spectrogram
-
-Recommended first usage
------------------------
-- Input representation: mixture magnitude spectrogram
-- Output mode: ``mask``
-- Output activation: ``sigmoid``
-- ASD features: collect encoder outputs + bottleneck feature
+Important
+---------
+This file alone does **not** activate pretrained usage. It only provides the
+model-side compatibility needed so that ``train_sep.py`` / ``ssmodule_sep.py``
+can later load an external AudioSep-style checkpoint into the separator.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
+from .conditioning import (
+    LatentFeatureInjection2d,
+    LatentInjectionConfig,
+    LearnedHiddenStateFusion,
+    TimeFiLM2d,
+    TimeFiLMConfig,
+)
+from .dprnn import DPRNN2d, DPRNNConfig
 from .resunet_blocks import (
     BlockConfig,
     BottleneckStage2d,
@@ -63,6 +62,28 @@ class ResUNetSeparatorConfig:
     return_decoder_features: bool = False
     asd_feature_source: str = "encoder_bottleneck"
 
+    # Morocutti-style extensions.
+    use_dprnn: bool = False
+    dprnn_hidden_size: int = 256
+    dprnn_num_layers: int = 2
+    dprnn_dropout: float = 0.0
+    dprnn_bidirectional: bool = True
+    dprnn_rnn_type: str = "gru"
+
+    use_time_film: bool = False
+    time_film_on_bottleneck: bool = True
+    time_film_on_decoder: bool = False
+    time_film_condition_dim: int = 1
+    time_film_hidden_dim: int = 128
+    time_film_num_layers: int = 2
+    time_film_dropout: float = 0.0
+    time_film_residual_gamma: bool = True
+
+    use_latent_injection: bool = False
+    latent_injection_input_dim: int = 256
+    latent_injection_hidden_dim: int = 256
+    latent_injection_num_hidden_states: int = 4
+
 
 class ResUNetSeparator(nn.Module):
     """Lightweight ResUNet separator for the ASD source-separation pipeline.
@@ -71,22 +92,27 @@ class ResUNetSeparator(nn.Module):
     --------------
     Input:
         ``mix_spec`` with shape ``[B, 1, F, T]``.
+
+    Optional conditioning:
+        ``time_condition`` with shape ``[B, T]`` or ``[B, D, T]``
+        ``hidden_states`` as a sequence of ``[B, T, D]`` tensors
+
     Output dictionary:
         - ``pred_spec``: predicted target spectrogram ``[B,1,F,T]``
         - ``pred_mask``: predicted mask ``[B,1,F,T]`` when ``output_mode='mask'``
         - ``encoder_features``: list of encoder feature maps
         - ``skip_features``: list of skip tensors used by the decoder
-        - ``bottleneck_feature``: bottleneck tensor
+        - ``bottleneck_feature``: bottleneck tensor after optional conditioning
         - ``decoder_features``: list of decoder feature maps
         - ``asd_feature_maps``: feature maps intended for later ASD embedding
+        - ``conditioning_debug``: optional info about FiLM / injection / fusion
     """
 
     VALID_OUTPUT_MODES = {"mask", "direct"}
     VALID_ASD_FEATURE_SOURCES = {"encoder_bottleneck", "all", "bottleneck_only"}
 
-    def __init__(self, config: Optional[ResUNetSeparatorConfig] = None, **kwargs) -> None:
+    def __init__(self, config: Optional[ResUNetSeparatorConfig] = None, **kwargs: Any) -> None:
         super().__init__()
-
         if config is None:
             config = ResUNetSeparatorConfig(**kwargs)
         self.config = config
@@ -110,6 +136,7 @@ class ResUNetSeparator(nn.Module):
         bottleneck_channels = (
             encoder_channels[-1] if self.config.bottleneck_channels is None else int(self.config.bottleneck_channels)
         )
+
         self.encoder_channels = encoder_channels
         self.stem_channels = stem_channels
         self.bottleneck_channels = bottleneck_channels
@@ -184,6 +211,7 @@ class ResUNetSeparator(nn.Module):
             decoder_stages.append(stage)
             current_channels = out_channels
         self.decoder = nn.ModuleList(decoder_stages)
+        self.decoder_out_channels = tuple(decoder_out_channels)
 
         self.post_decoder = ConvNormAct2d(
             in_channels=current_channels,
@@ -196,12 +224,61 @@ class ResUNetSeparator(nn.Module):
             dropout=cfg.dropout,
             use_bias=cfg.use_bias,
         )
-
         self.output_head = SpectrogramHead2d(
             in_channels=stem_channels,
             out_channels=1,
             output_activation=self.output_activation,
         )
+
+        # Optional Morocutti-style extension modules.
+        self.dprnn: Optional[nn.Module]
+        if self.config.use_dprnn:
+            self.dprnn = DPRNN2d(
+                DPRNNConfig(
+                    channels=bottleneck_channels,
+                    hidden_size=self.config.dprnn_hidden_size,
+                    num_layers=self.config.dprnn_num_layers,
+                    dropout=self.config.dprnn_dropout,
+                    bidirectional=self.config.dprnn_bidirectional,
+                    rnn_type=self.config.dprnn_rnn_type,
+                )
+            )
+        else:
+            self.dprnn = None
+
+        self.bottleneck_time_film: Optional[TimeFiLM2d]
+        self.decoder_time_film: Optional[nn.ModuleList]
+        if self.config.use_time_film:
+            tf_cfg = TimeFiLMConfig(
+                condition_dim=self.config.time_film_condition_dim,
+                hidden_dim=self.config.time_film_hidden_dim,
+                num_layers=self.config.time_film_num_layers,
+                dropout=self.config.time_film_dropout,
+                residual_gamma=self.config.time_film_residual_gamma,
+            )
+            self.bottleneck_time_film = TimeFiLM2d(bottleneck_channels, tf_cfg) if self.config.time_film_on_bottleneck else None
+            self.decoder_time_film = (
+                nn.ModuleList([TimeFiLM2d(channels, tf_cfg) for channels in self.decoder_out_channels])
+                if self.config.time_film_on_decoder
+                else None
+            )
+        else:
+            self.bottleneck_time_film = None
+            self.decoder_time_film = None
+
+        self.hidden_state_fusion: Optional[LearnedHiddenStateFusion] = None
+        self.latent_injection: Optional[LatentFeatureInjection2d]
+        if self.config.use_latent_injection:
+            self.hidden_state_fusion = LearnedHiddenStateFusion(self.config.latent_injection_num_hidden_states)
+            self.latent_injection = LatentFeatureInjection2d(
+                LatentInjectionConfig(
+                    input_dim=self.config.latent_injection_input_dim,
+                    target_channels=bottleneck_channels,
+                    hidden_dim=self.config.latent_injection_hidden_dim,
+                )
+            )
+        else:
+            self.latent_injection = None
 
     @staticmethod
     def _validate_input_spec(mix_spec: torch.Tensor) -> torch.Tensor:
@@ -239,7 +316,73 @@ class ResUNetSeparator(nn.Module):
             return feats
         raise RuntimeError(f"Unexpected asd_feature_source={source!r}.")
 
-    def encode(self, mix_spec: torch.Tensor) -> Dict[str, object]:
+    def _maybe_fuse_hidden_states(
+        self,
+        hidden_states: Optional[Sequence[torch.Tensor]],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        if not self.config.use_latent_injection:
+            return None, {}
+        if hidden_states is None or len(hidden_states) == 0:
+            return None, {}
+
+        if self.hidden_state_fusion is None or self.hidden_state_fusion.num_states != len(hidden_states):
+            # Lazily adapt to the actual guide depth if it differs from config.
+            self.hidden_state_fusion = LearnedHiddenStateFusion(len(hidden_states)).to(hidden_states[0].device)
+
+        fusion_out = self.hidden_state_fusion(hidden_states)
+        return fusion_out["fused_hidden_state"], fusion_out
+
+    def _apply_bottleneck_conditioning(
+        self,
+        bottleneck_feature: torch.Tensor,
+        *,
+        time_condition: Optional[torch.Tensor] = None,
+        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        debug: Dict[str, Any] = {}
+        h = bottleneck_feature
+
+        fused_hidden_state, fusion_debug = self._maybe_fuse_hidden_states(hidden_states)
+        if fused_hidden_state is not None and self.latent_injection is not None:
+            inj_out = self.latent_injection(h, fused_hidden_state)
+            h = inj_out["output"]
+            debug["hidden_state_fusion"] = fusion_debug
+            debug["latent_injection"] = inj_out
+
+        if self.dprnn is not None:
+            dprnn_out = self.dprnn(h)
+            if isinstance(dprnn_out, dict):
+                h = dprnn_out.get("output", h)
+                debug["dprnn"] = dprnn_out
+            else:
+                h = dprnn_out
+
+        if self.bottleneck_time_film is not None and time_condition is not None:
+            film_out = self.bottleneck_time_film(h, time_condition)
+            h = film_out["output"]
+            debug["bottleneck_time_film"] = film_out
+
+        return h, debug
+
+    def _apply_decoder_conditioning(
+        self,
+        feature_map: torch.Tensor,
+        stage_index: int,
+        *,
+        time_condition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if self.decoder_time_film is None or time_condition is None:
+            return feature_map, {}
+        film_out = self.decoder_time_film[stage_index](feature_map, time_condition)
+        return film_out["output"], film_out
+
+    def encode(
+        self,
+        mix_spec: torch.Tensor,
+        *,
+        time_condition: Optional[torch.Tensor] = None,
+        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+    ) -> Dict[str, object]:
         x = self._validate_input_spec(mix_spec)
         x = self.stem(x)
 
@@ -253,44 +396,74 @@ class ResUNetSeparator(nn.Module):
 
         h = self.pre_bottleneck(h)
         bottleneck_feature = self.bottleneck(h)
-
+        bottleneck_feature, conditioning_debug = self._apply_bottleneck_conditioning(
+            bottleneck_feature,
+            time_condition=time_condition,
+            hidden_states=hidden_states,
+        )
         return {
             "stem_feature": x,
             "encoder_features": encoder_features,
             "skip_features": skip_features,
             "bottleneck_feature": bottleneck_feature,
+            "conditioning_debug": conditioning_debug,
         }
 
     def decode(
         self,
         bottleneck_feature: torch.Tensor,
         skip_features: Sequence[torch.Tensor],
+        *,
+        time_condition: Optional[torch.Tensor] = None,
     ) -> Dict[str, object]:
         h = bottleneck_feature
         decoder_features: List[torch.Tensor] = []
+        decoder_conditioning_debug: List[Dict[str, torch.Tensor]] = []
         effective_skips = list(reversed(list(skip_features[:-1])))
 
-        for stage, skip in zip(self.decoder, effective_skips):
+        for stage_index, (stage, skip) in enumerate(zip(self.decoder, effective_skips)):
             h = stage(h, skip)
+            h, stage_debug = self._apply_decoder_conditioning(
+                h,
+                stage_index,
+                time_condition=time_condition,
+            )
             decoder_features.append(h)
+            decoder_conditioning_debug.append(stage_debug)
 
         h = self.post_decoder(h)
         pred_head = self.output_head(h)
         return {
             "decoder_features": decoder_features,
+            "decoder_conditioning_debug": decoder_conditioning_debug,
             "pre_output_feature": h,
             "pred_head": pred_head,
         }
 
-    def forward(self, mix_spec: torch.Tensor) -> Dict[str, object]:
+    def forward(
+        self,
+        mix_spec: torch.Tensor,
+        *,
+        time_condition: Optional[torch.Tensor] = None,
+        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+        return_conditioning_debug: bool = True,
+    ) -> Dict[str, object]:
         mix_spec = self._validate_input_spec(mix_spec)
         input_hw = mix_spec.shape[-2:]
 
-        enc = self.encode(mix_spec)
+        enc = self.encode(
+            mix_spec,
+            time_condition=time_condition,
+            hidden_states=hidden_states,
+        )
         bottleneck_feature = enc["bottleneck_feature"]
         skip_features = enc["skip_features"]
-        dec = self.decode(bottleneck_feature, skip_features)
 
+        dec = self.decode(
+            bottleneck_feature,
+            skip_features,
+            time_condition=time_condition,
+        )
         pred_head = center_crop_or_pad_2d(dec["pred_head"], target_hw=input_hw)
 
         if self.config.output_mode == "mask":
@@ -307,7 +480,7 @@ class ResUNetSeparator(nn.Module):
             decoder_features=decoder_features,
         )
 
-        return {
+        output: Dict[str, object] = {
             "input_spec": mix_spec,
             "pred_spec": pred_spec,
             "pred_mask": pred_mask,
@@ -319,9 +492,90 @@ class ResUNetSeparator(nn.Module):
             "pre_output_feature": dec["pre_output_feature"],
             "asd_feature_maps": asd_feature_maps,
         }
+        if return_conditioning_debug:
+            output["conditioning_debug"] = {
+                "encode": enc.get("conditioning_debug", {}),
+                "decode": dec.get("decoder_conditioning_debug", []),
+            }
+        return output
+
+    def load_pretrained_separator_state_dict(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        *,
+        strict_backbone: bool = False,
+        strip_prefixes: Iterable[str] = (
+            "separator.",
+            "model.separator.",
+            "module.separator.",
+            "module.",
+        ),
+    ) -> Dict[str, Any]:
+        """Partially load a pretrained separator checkpoint.
+
+        This helper is intended for later AudioSep-style initialization. It
+        filters a foreign state dict down to keys that exist in the current
+        separator **and** match the expected tensor shape.
+
+        Parameters
+        ----------
+        state_dict:
+            Raw state dict from an external checkpoint, or the ``state_dict``
+            field already extracted from one.
+        strict_backbone:
+            If ``True``, call ``load_state_dict(..., strict=True)`` on the
+            filtered backbone keys. In practice ``False`` is recommended for the
+            first AudioSep transfer attempt.
+        strip_prefixes:
+            Candidate key prefixes to remove before matching against the current
+            separator keys.
+        """
+
+        if not isinstance(state_dict, Mapping):
+            raise TypeError(f"state_dict must be a mapping, got {type(state_dict)!r}.")
+
+        own_state = self.state_dict()
+        normalized_state: Dict[str, torch.Tensor] = {}
+        unexpected_source_keys: List[str] = []
+        skipped_shape_keys: List[str] = []
+
+        for raw_key, value in state_dict.items():
+            if not torch.is_tensor(value):
+                continue
+
+            candidate_keys = [raw_key]
+            for prefix in strip_prefixes:
+                if raw_key.startswith(prefix):
+                    candidate_keys.append(raw_key[len(prefix) :])
+
+            matched_key: Optional[str] = None
+            for key in candidate_keys:
+                if key in own_state:
+                    matched_key = key
+                    break
+
+            if matched_key is None:
+                unexpected_source_keys.append(raw_key)
+                continue
+
+            if tuple(value.shape) != tuple(own_state[matched_key].shape):
+                skipped_shape_keys.append(raw_key)
+                continue
+
+            normalized_state[matched_key] = value
+
+        incompatible = self.load_state_dict(normalized_state, strict=strict_backbone)
+        return {
+            "num_loaded_tensors": len(normalized_state),
+            "loaded_keys": sorted(normalized_state.keys()),
+            "missing_keys": list(incompatible.missing_keys),
+            "unexpected_keys": list(incompatible.unexpected_keys),
+            "unexpected_source_keys": unexpected_source_keys,
+            "skipped_shape_keys": skipped_shape_keys,
+        }
 
 
-def build_resunet_separator(**kwargs) -> ResUNetSeparator:
+def build_resunet_separator(**kwargs: Any) -> ResUNetSeparator:
     return ResUNetSeparator(**kwargs)
 
 

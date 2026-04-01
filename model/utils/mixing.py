@@ -1,20 +1,17 @@
 """Utilities for building synthetic source-separation mixtures.
 
 This module is designed for the ASD source-separation proxy pipeline.
-It focuses on one job: given a target machine waveform and an interference
-waveform, create a stable training mixture with a desired SNR.
+It keeps the original simple target+interference mixing workflow, but adds
+optional augmentation hooks that are useful when porting ideas from stronger
+source-separation systems:
 
-Main features
--------------
-- zero-mean normalization
-- mono conversion safety check
-- crop / pad helpers
-- random segment sampling
-- interference scaling to a target SNR
-- optional peak normalization after mixing
-- metadata dictionary for logging/debugging
+- optional room impulse response (RIR) convolution
+- optional background-noise injection
+- richer metadata for debugging and ablation
+- compatibility with both ``build_training_mixture`` and
+  ``build_fixed_snr_mixture(..., config=...)`` call styles
 
-The functions here operate on NumPy arrays because the current project's data
+The functions operate on NumPy arrays because the current project's data
 loading stack already uses ``soundfile`` + NumPy before converting to Torch.
 """
 
@@ -33,21 +30,30 @@ EPS = 1e-8
 class MixingConfig:
     """Configuration for synthetic mixture generation.
 
-    Attributes
+    Parameters
     ----------
     sample_rate:
         Audio sample rate.
     segment_seconds:
         Target segment duration in seconds.
-    snr_min_db:
-        Minimum SNR sampled during training.
-    snr_max_db:
-        Maximum SNR sampled during training.
+    snr_min_db, snr_max_db:
+        Uniform sampling range for the main target-vs-interference SNR.
     peak_normalize:
-        Whether to peak-normalize mixture/target/interference together after
-        mixing. This keeps values within a stable range.
+        Whether to peak-normalize the final outputs together.
     zero_mean:
         Whether to remove DC offset before mixing.
+    peak_target:
+        Peak value after peak normalization.
+    rir_probability:
+        Probability of applying a provided shared/per-component RIR.
+    normalize_rir:
+        Whether to L1-normalize the RIR before convolution.
+    apply_rir_to_target, apply_rir_to_interference, apply_rir_to_background:
+        Component-wise switches for RIR augmentation.
+    background_probability:
+        Probability of using provided background noise during training.
+    background_snr_min_db, background_snr_max_db:
+        SNR range for background noise relative to the target.
     """
 
     sample_rate: int = 16000
@@ -56,6 +62,17 @@ class MixingConfig:
     snr_max_db: float = 5.0
     peak_normalize: bool = True
     zero_mean: bool = True
+    peak_target: float = 0.99
+
+    rir_probability: float = 0.0
+    normalize_rir: bool = True
+    apply_rir_to_target: bool = True
+    apply_rir_to_interference: bool = True
+    apply_rir_to_background: bool = True
+
+    background_probability: float = 0.0
+    background_snr_min_db: Optional[float] = None
+    background_snr_max_db: Optional[float] = None
 
     @property
     def segment_samples(self) -> int:
@@ -63,19 +80,7 @@ class MixingConfig:
 
 
 def ensure_float32_mono(wave: ArrayLike) -> np.ndarray:
-    """Convert input audio to a contiguous 1-D float32 mono waveform.
-
-    Parameters
-    ----------
-    wave:
-        Input waveform. Accepts shape ``[T]`` or ``[T, C]`` or ``[C, T]``.
-
-    Returns
-    -------
-    np.ndarray
-        Mono waveform of shape ``[T]`` and dtype ``float32``.
-    """
-
+    """Convert input audio to a contiguous 1-D float32 mono waveform."""
     wave = np.asarray(wave, dtype=np.float32)
 
     if wave.ndim == 1:
@@ -84,17 +89,14 @@ def ensure_float32_mono(wave: ArrayLike) -> np.ndarray:
     if wave.ndim != 2:
         raise ValueError(f"Expected 1-D or 2-D waveform, got shape {wave.shape}.")
 
-    # Handle [T, C] or [C, T]
     if wave.shape[0] == 1:
         mono = wave[0]
     elif wave.shape[1] == 1:
         mono = wave[:, 0]
     elif wave.shape[0] < wave.shape[1]:
-        # Likely [C, T]
-        mono = wave.mean(axis=0)
+        mono = wave.mean(axis=0)  # likely [C, T]
     else:
-        # Likely [T, C]
-        mono = wave.mean(axis=1)
+        mono = wave.mean(axis=1)  # likely [T, C]
 
     return np.ascontiguousarray(mono.astype(np.float32, copy=False))
 
@@ -121,11 +123,7 @@ def peak_normalize(wave: ArrayLike, eps: float = EPS) -> np.ndarray:
 
 
 def match_length(wave: ArrayLike, target_length: int, pad_value: float = 0.0) -> np.ndarray:
-    """Pad or crop a waveform to a fixed number of samples.
-
-    This uses deterministic center crop for overlong signals. For random crop,
-    use :func:`random_segment`.
-    """
+    """Pad or crop a waveform to a fixed number of samples."""
     wave = ensure_float32_mono(wave)
     length = wave.shape[0]
 
@@ -146,22 +144,7 @@ def random_segment(
     pad_if_short: bool = True,
     pad_value: float = 0.0,
 ) -> np.ndarray:
-    """Sample a random fixed-length segment from a waveform.
-
-    Parameters
-    ----------
-    wave:
-        Input waveform.
-    segment_length:
-        Desired output length in samples.
-    rng:
-        Optional NumPy random generator.
-    pad_if_short:
-        If True and the waveform is shorter than ``segment_length``, pad with
-        zeros. Otherwise raise ``ValueError``.
-    pad_value:
-        Constant padding value when padding is used.
-    """
+    """Sample a random fixed-length segment from a waveform."""
     wave = ensure_float32_mono(wave)
     rng = rng or np.random.default_rng()
     length = wave.shape[0]
@@ -191,26 +174,117 @@ def sample_snr_db(
     return float(rng.uniform(snr_min_db, snr_max_db))
 
 
+def should_apply(probability: float, rng: Optional[np.random.Generator] = None) -> bool:
+    """Bernoulli helper for optional augmentations."""
+    rng = rng or np.random.default_rng()
+    probability = float(np.clip(probability, 0.0, 1.0))
+    return bool(rng.random() < probability)
+
+
+def scale_signal_to_reference_snr(
+    reference: ArrayLike,
+    signal: ArrayLike,
+    snr_db: float,
+    eps: float = EPS,
+) -> np.ndarray:
+    """Scale ``signal`` so that ``reference / signal`` matches ``snr_db``."""
+    reference = ensure_float32_mono(reference)
+    signal = ensure_float32_mono(signal)
+
+    reference_rms = rms(reference, eps=eps)
+    signal_rms = rms(signal, eps=eps)
+
+    desired_signal_rms = reference_rms / (10.0 ** (snr_db / 20.0))
+    scale = desired_signal_rms / max(signal_rms, eps)
+    return (signal * scale).astype(np.float32, copy=False)
+
+
 def scale_interference_to_snr(
     target: ArrayLike,
     interference: ArrayLike,
     snr_db: float,
     eps: float = EPS,
 ) -> np.ndarray:
-    """Scale interference so that target/interference reaches the desired SNR.
+    """Backward-compatible alias for target-vs-interference scaling."""
+    return scale_signal_to_reference_snr(target, interference, snr_db, eps=eps)
 
-    SNR definition used here:
-        snr_db = 20 * log10(rms(target) / rms(interference_scaled))
-    """
-    target = ensure_float32_mono(target)
-    interference = ensure_float32_mono(interference)
 
-    target_rms = rms(target, eps=eps)
-    interference_rms = rms(interference, eps=eps)
+def normalize_rir_kernel(rir: ArrayLike, eps: float = EPS) -> np.ndarray:
+    """L1-normalize an RIR kernel for stable convolution energy."""
+    rir = ensure_float32_mono(rir)
+    norm = float(np.sum(np.abs(rir), dtype=np.float32))
+    if norm < eps:
+        return rir.copy()
+    return np.ascontiguousarray((rir / norm).astype(np.float32, copy=False))
 
-    desired_interference_rms = target_rms / (10.0 ** (snr_db / 20.0))
-    scale = desired_interference_rms / max(interference_rms, eps)
-    return (interference * scale).astype(np.float32, copy=False)
+
+def convolve_with_rir(
+    wave: ArrayLike,
+    rir: ArrayLike,
+    normalize_kernel: bool = True,
+    keep_length: bool = True,
+) -> np.ndarray:
+    """Apply 1-D convolution with an RIR and optionally keep original length."""
+    wave = ensure_float32_mono(wave)
+    rir = ensure_float32_mono(rir)
+
+    if normalize_kernel:
+        rir = normalize_rir_kernel(rir)
+
+    convolved = np.convolve(wave, rir, mode="full").astype(np.float32, copy=False)
+
+    if not keep_length:
+        return np.ascontiguousarray(convolved)
+
+    if convolved.shape[0] < wave.shape[0]:
+        return match_length(convolved, wave.shape[0], pad_value=0.0)
+    return np.ascontiguousarray(convolved[: wave.shape[0]])
+
+
+def maybe_apply_rir(
+    wave: ArrayLike,
+    rir_wave: Optional[ArrayLike],
+    *,
+    enabled: bool,
+    probability: float,
+    normalize_kernel: bool,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[np.ndarray, bool]:
+    """Optionally convolve a waveform with a provided RIR."""
+    wave = ensure_float32_mono(wave)
+    if not enabled or rir_wave is None:
+        return wave, False
+
+    if not should_apply(probability=probability, rng=rng):
+        return wave, False
+
+    return convolve_with_rir(wave, rir_wave, normalize_kernel=normalize_kernel), True
+
+
+def _joint_peak_normalize(
+    mixture: np.ndarray,
+    target: np.ndarray,
+    interference: np.ndarray,
+    background: Optional[np.ndarray] = None,
+    *,
+    peak_target: float = 0.99,
+    eps: float = EPS,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], float]:
+    """Normalize all components with one shared factor."""
+    candidates = [np.abs(mixture), np.abs(target), np.abs(interference)]
+    if background is not None:
+        candidates.append(np.abs(background))
+    peak = float(max(float(np.max(x)) for x in candidates))
+    if peak <= eps:
+        return mixture, target, interference, background, 1.0
+
+    scale = float(peak_target / peak)
+    mixture = (mixture * scale).astype(np.float32, copy=False)
+    target = (target * scale).astype(np.float32, copy=False)
+    interference = (interference * scale).astype(np.float32, copy=False)
+    if background is not None:
+        background = (background * scale).astype(np.float32, copy=False)
+    return mixture, target, interference, background, scale
 
 
 def mix_signals(
@@ -220,13 +294,15 @@ def mix_signals(
     peak_norm: bool = True,
     zero_mean_before_mix: bool = True,
     eps: float = EPS,
+    background: Optional[ArrayLike] = None,
+    background_snr_db: Optional[float] = None,
+    peak_target: float = 0.99,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create a mixture and return aligned target/interference copies.
 
-    Returns
-    -------
-    mixture, target_out, interference_out : np.ndarray
-        All arrays have identical length and dtype ``float32``.
+    When ``background`` is provided, it is also scaled relative to the target
+    using ``background_snr_db`` and added into the mixture, but the original
+    return signature is preserved for backward compatibility.
     """
     target = ensure_float32_mono(target)
     interference = ensure_float32_mono(interference)
@@ -237,19 +313,39 @@ def mix_signals(
             f"Got {target.shape[0]} and {interference.shape[0]}."
         )
 
+    background_scaled: Optional[np.ndarray] = None
+    if background is not None:
+        background = ensure_float32_mono(background)
+        if background.shape[0] != target.shape[0]:
+            raise ValueError(
+                "Background must have the same length as the target before mixing. "
+                f"Got {background.shape[0]} and {target.shape[0]}."
+            )
+
     if zero_mean_before_mix:
         target = zero_mean(target)
         interference = zero_mean(interference)
+        if background is not None:
+            background = zero_mean(background)
 
     interference_scaled = scale_interference_to_snr(target, interference, snr_db, eps=eps)
     mixture = target + interference_scaled
 
+    if background is not None:
+        if background_snr_db is None:
+            raise ValueError("background_snr_db must be provided when background is used.")
+        background_scaled = scale_signal_to_reference_snr(target, background, background_snr_db, eps=eps)
+        mixture = mixture + background_scaled
+
     if peak_norm:
-        peak = float(np.max(np.abs([mixture, target, interference_scaled])))
-        if peak > eps:
-            mixture = mixture / peak
-            target = target / peak
-            interference_scaled = interference_scaled / peak
+        mixture, target, interference_scaled, _, _ = _joint_peak_normalize(
+            mixture=mixture,
+            target=target,
+            interference=interference_scaled,
+            background=background_scaled,
+            peak_target=peak_target,
+            eps=eps,
+        )
 
     return (
         np.ascontiguousarray(mixture.astype(np.float32, copy=False)),
@@ -258,39 +354,98 @@ def mix_signals(
     )
 
 
+def _resolve_config(
+    config: Optional[MixingConfig],
+    *,
+    sample_rate: int = 16000,
+    segment_seconds: float = 2.0,
+    snr_min_db: float = -5.0,
+    snr_max_db: float = 5.0,
+    peak_norm: bool = True,
+    zero_mean_before_mix: bool = True,
+) -> MixingConfig:
+    """Create a config from explicit args when one is not provided."""
+    if config is not None:
+        return config
+    return MixingConfig(
+        sample_rate=sample_rate,
+        segment_seconds=segment_seconds,
+        snr_min_db=snr_min_db,
+        snr_max_db=snr_max_db,
+        peak_normalize=peak_norm,
+        zero_mean=zero_mean_before_mix,
+    )
+
+
 def build_training_mixture(
     target_wave: ArrayLike,
     interference_wave: ArrayLike,
     config: Optional[MixingConfig] = None,
     rng: Optional[np.random.Generator] = None,
-) -> Dict[str, Union[np.ndarray, float, int]]:
-    """Build one synthetic training sample for source-separation proxy learning.
-
-    Workflow
-    --------
-    1. convert both signals to mono float32
-    2. random-crop/pad each to a fixed segment length
-    3. sample SNR from the configured range
-    4. scale interference to target SNR and mix
-    5. optionally peak-normalize outputs
-
-    Returns
-    -------
-    dict
-        Keys:
-        - ``mix_wave``
-        - ``target_wave``
-        - ``interference_wave``
-        - ``snr_db``
-        - ``segment_length``
-    """
+    *,
+    background_wave: Optional[ArrayLike] = None,
+    shared_rir_wave: Optional[ArrayLike] = None,
+    target_rir_wave: Optional[ArrayLike] = None,
+    interference_rir_wave: Optional[ArrayLike] = None,
+    background_rir_wave: Optional[ArrayLike] = None,
+) -> Dict[str, Union[np.ndarray, float, int, bool, None]]:
+    """Build one synthetic training sample for source-separation proxy learning."""
     config = config or MixingConfig()
     rng = rng or np.random.default_rng()
     seg_len = config.segment_samples
 
     target_seg = random_segment(target_wave, seg_len, rng=rng, pad_if_short=True)
     interference_seg = random_segment(interference_wave, seg_len, rng=rng, pad_if_short=True)
+
+    use_shared_rir = shared_rir_wave is not None
+    target_rir = shared_rir_wave if use_shared_rir else target_rir_wave
+    interference_rir = shared_rir_wave if use_shared_rir else interference_rir_wave
+    background_rir = shared_rir_wave if use_shared_rir else background_rir_wave
+
+    target_seg, target_rir_applied = maybe_apply_rir(
+        target_seg,
+        target_rir,
+        enabled=config.apply_rir_to_target,
+        probability=config.rir_probability,
+        normalize_kernel=config.normalize_rir,
+        rng=rng,
+    )
+    interference_seg, interference_rir_applied = maybe_apply_rir(
+        interference_seg,
+        interference_rir,
+        enabled=config.apply_rir_to_interference,
+        probability=config.rir_probability,
+        normalize_kernel=config.normalize_rir,
+        rng=rng,
+    )
+
     snr_db = sample_snr_db(config.snr_min_db, config.snr_max_db, rng=rng)
+
+    background_seg: Optional[np.ndarray] = None
+    background_snr_db: Optional[float] = None
+    background_used = False
+    background_rir_applied = False
+
+    if background_wave is not None and should_apply(config.background_probability, rng=rng):
+        background_seg = random_segment(background_wave, seg_len, rng=rng, pad_if_short=True)
+        background_seg, background_rir_applied = maybe_apply_rir(
+            background_seg,
+            background_rir,
+            enabled=config.apply_rir_to_background,
+            probability=config.rir_probability,
+            normalize_kernel=config.normalize_rir,
+            rng=rng,
+        )
+        if config.background_snr_min_db is None or config.background_snr_max_db is None:
+            raise ValueError(
+                "background_wave was provided, but background_snr_min_db/max_db are not set in MixingConfig."
+            )
+        background_snr_db = sample_snr_db(
+            config.background_snr_min_db,
+            config.background_snr_max_db,
+            rng=rng,
+        )
+        background_used = True
 
     mix_wave, target_seg, interference_seg = mix_signals(
         target=target_seg,
@@ -298,6 +453,9 @@ def build_training_mixture(
         snr_db=snr_db,
         peak_norm=config.peak_normalize,
         zero_mean_before_mix=config.zero_mean,
+        background=background_seg,
+        background_snr_db=background_snr_db,
+        peak_target=config.peak_target,
     )
 
     return {
@@ -306,6 +464,12 @@ def build_training_mixture(
         "interference_wave": interference_seg,
         "snr_db": snr_db,
         "segment_length": seg_len,
+        "background_used": background_used,
+        "background_snr_db": background_snr_db,
+        "shared_rir_provided": use_shared_rir,
+        "target_rir_applied": target_rir_applied,
+        "interference_rir_applied": interference_rir_applied,
+        "background_rir_applied": background_rir_applied,
     }
 
 
@@ -318,24 +482,79 @@ def build_fixed_snr_mixture(
     peak_norm: bool = True,
     zero_mean_before_mix: bool = True,
     rng: Optional[np.random.Generator] = None,
-) -> Dict[str, Union[np.ndarray, float, int]]:
-    """Build a mixture at a specified SNR.
-
-    Useful for validation, ablation, and SI-SDRi evaluation at fixed SNR values
-    such as -5, 0, and 5 dB.
-    """
+    config: Optional[MixingConfig] = None,
+    *,
+    background_wave: Optional[ArrayLike] = None,
+    background_snr_db: Optional[float] = None,
+    shared_rir_wave: Optional[ArrayLike] = None,
+    target_rir_wave: Optional[ArrayLike] = None,
+    interference_rir_wave: Optional[ArrayLike] = None,
+    background_rir_wave: Optional[ArrayLike] = None,
+) -> Dict[str, Union[np.ndarray, float, int, bool, None]]:
+    """Build a mixture at a specified SNR."""
     rng = rng or np.random.default_rng()
-    seg_len = int(round(sample_rate * segment_seconds))
+    config = _resolve_config(
+        config,
+        sample_rate=sample_rate,
+        segment_seconds=segment_seconds,
+        snr_min_db=float(snr_db),
+        snr_max_db=float(snr_db),
+        peak_norm=peak_norm,
+        zero_mean_before_mix=zero_mean_before_mix,
+    )
+    seg_len = config.segment_samples
 
     target_seg = random_segment(target_wave, seg_len, rng=rng, pad_if_short=True)
     interference_seg = random_segment(interference_wave, seg_len, rng=rng, pad_if_short=True)
 
+    use_shared_rir = shared_rir_wave is not None
+    target_rir = shared_rir_wave if use_shared_rir else target_rir_wave
+    interference_rir = shared_rir_wave if use_shared_rir else interference_rir_wave
+    background_rir = shared_rir_wave if use_shared_rir else background_rir_wave
+
+    target_seg, target_rir_applied = maybe_apply_rir(
+        target_seg,
+        target_rir,
+        enabled=config.apply_rir_to_target,
+        probability=config.rir_probability,
+        normalize_kernel=config.normalize_rir,
+        rng=rng,
+    )
+    interference_seg, interference_rir_applied = maybe_apply_rir(
+        interference_seg,
+        interference_rir,
+        enabled=config.apply_rir_to_interference,
+        probability=config.rir_probability,
+        normalize_kernel=config.normalize_rir,
+        rng=rng,
+    )
+
+    background_seg: Optional[np.ndarray] = None
+    background_used = False
+    background_rir_applied = False
+    if background_wave is not None:
+        if background_snr_db is None:
+            raise ValueError("background_snr_db must be provided when background_wave is used.")
+        background_seg = random_segment(background_wave, seg_len, rng=rng, pad_if_short=True)
+        background_seg, background_rir_applied = maybe_apply_rir(
+            background_seg,
+            background_rir,
+            enabled=config.apply_rir_to_background,
+            probability=config.rir_probability,
+            normalize_kernel=config.normalize_rir,
+            rng=rng,
+        )
+        background_used = True
+
     mix_wave, target_seg, interference_seg = mix_signals(
         target=target_seg,
         interference=interference_seg,
-        snr_db=snr_db,
-        peak_norm=peak_norm,
-        zero_mean_before_mix=zero_mean_before_mix,
+        snr_db=float(snr_db),
+        peak_norm=config.peak_normalize,
+        zero_mean_before_mix=config.zero_mean,
+        background=background_seg,
+        background_snr_db=background_snr_db,
+        peak_target=config.peak_target,
     )
 
     return {
@@ -344,6 +563,12 @@ def build_fixed_snr_mixture(
         "interference_wave": interference_seg,
         "snr_db": float(snr_db),
         "segment_length": seg_len,
+        "background_used": background_used,
+        "background_snr_db": background_snr_db,
+        "shared_rir_provided": use_shared_rir,
+        "target_rir_applied": target_rir_applied,
+        "interference_rir_applied": interference_rir_applied,
+        "background_rir_applied": background_rir_applied,
     }
 
 
@@ -359,17 +584,23 @@ def estimate_realized_snr_db(
 
 
 __all__ = [
+    "EPS",
     "MixingConfig",
     "build_fixed_snr_mixture",
     "build_training_mixture",
+    "convolve_with_rir",
     "ensure_float32_mono",
     "estimate_realized_snr_db",
     "match_length",
+    "maybe_apply_rir",
     "mix_signals",
+    "normalize_rir_kernel",
     "peak_normalize",
     "random_segment",
     "rms",
     "sample_snr_db",
     "scale_interference_to_snr",
+    "scale_signal_to_reference_snr",
+    "should_apply",
     "zero_mean",
 ]

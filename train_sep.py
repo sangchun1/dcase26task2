@@ -5,7 +5,8 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="hear21passt.mo
 import os
 import glob
 import argparse
-from typing import Optional, Union, List, Mapping, Any
+from pathlib import Path
+from typing import Optional, Union, List, Mapping, Any, Dict, Tuple
 
 import torch
 import lightning as pl
@@ -104,12 +105,135 @@ def load_state_dict_from_checkpoint(model: ssmodule_sep, ckpt_path: str, device:
     ckpt = torch.load(ckpt_path, map_location=device)
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    if isinstance(ckpt, dict) and "md_state" in ckpt:
+        model.md_best_state = dict(ckpt["md_state"])
+        print("Restored md_state from checkpoint.")
+
     print("Checkpoint loaded.")
     if missing:
         print(f"Missing keys ({len(missing)}): {missing[:10]}{' ...' if len(missing) > 10 else ''}")
     if unexpected:
         print(f"Unexpected keys ({len(unexpected)}): {unexpected[:10]}{' ...' if len(unexpected) > 10 else ''}")
     return model
+
+
+# -----------------------------------------------------------------------------
+# External pretrained component loading
+# -----------------------------------------------------------------------------
+def _load_checkpoint_payload(ckpt_path: str, device: str) -> Any:
+    ckpt_path = os.path.expanduser(os.path.expandvars(ckpt_path))
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    return torch.load(ckpt_path, map_location=device)
+
+
+def _extract_state_dict(payload: Any) -> Mapping[str, torch.Tensor]:
+    if isinstance(payload, Mapping):
+        for key in ("state_dict", "model", "model_state_dict", "net", "network", "weights"):
+            value = payload.get(key, None)
+            if isinstance(value, Mapping):
+                return value
+    if isinstance(payload, Mapping):
+        return payload
+    raise TypeError(f"Unsupported checkpoint payload type: {type(payload)}")
+
+
+def _strip_prefix_if_present(state_dict: Mapping[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+    prefix = str(prefix)
+    if not prefix:
+        return dict(state_dict)
+    stripped = {}
+    matched = False
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            stripped[key[len(prefix):]] = value
+            matched = True
+    return stripped if matched else dict(state_dict)
+
+
+def _prepare_component_state_dict(
+    state_dict: Mapping[str, torch.Tensor],
+    prefixes: List[str],
+) -> Dict[str, torch.Tensor]:
+    out = dict(state_dict)
+    for prefix in prefixes:
+        candidate = _strip_prefix_if_present(out, prefix)
+        if candidate != out:
+            return candidate
+    return out
+
+
+def _print_incompatible(prefix: str, incompatible: Any) -> None:
+    missing = getattr(incompatible, "missing_keys", [])
+    unexpected = getattr(incompatible, "unexpected_keys", [])
+    if missing:
+        print(f"{prefix} missing keys ({len(missing)}): {missing[:10]}{' ...' if len(missing) > 10 else ''}")
+    if unexpected:
+        print(f"{prefix} unexpected keys ({len(unexpected)}): {unexpected[:10]}{' ...' if len(unexpected) > 10 else ''}")
+
+
+def maybe_load_external_pretrained_components(
+    model: ssmodule_sep,
+    args: dict,
+    device: str,
+) -> None:
+    """Load external separator / guide checkpoints if requested.
+
+    This enables actual external pretrained initialization, e.g. an AudioSep
+    checkpoint for ``model.separator``, independent of ``--finetune_from``.
+    It is safe to use together with a LightningModule that also attempts its
+    own partial loading: loading the same checkpoint twice is harmless.
+    """
+    sep_ckpt = args.get("pretrained_sep_ckpt", None)
+    if sep_ckpt:
+        if not hasattr(model, "separator") or model.separator is None:
+            raise AttributeError("Model has no `separator` attribute to load into.")
+        payload = _load_checkpoint_payload(sep_ckpt, device=device)
+        state_dict = _extract_state_dict(payload)
+        state_dict = _prepare_component_state_dict(
+            state_dict,
+            prefixes=[
+                "separator.",
+                "model.separator.",
+                "module.separator.",
+                "net.separator.",
+                "backbone.",
+                "module.backbone.",
+            ],
+        )
+        strict = bool(args.get("pretrained_sep_strict_backbone", False))
+        incompatible = model.separator.load_state_dict(state_dict, strict=strict)
+        print(f"Loaded external separator checkpoint: {sep_ckpt}")
+        _print_incompatible("[separator]", incompatible)
+
+    guide_ckpt = args.get("pretrained_guide_ckpt", None)
+    if guide_ckpt:
+        guide_module = None
+        for attr_name in ("guide_encoder", "stage2_sed", "stage2_sed_guide"):
+            if hasattr(model, attr_name):
+                guide_module = getattr(model, attr_name)
+                if guide_module is not None:
+                    break
+        if guide_module is None:
+            raise AttributeError("Model has no guide encoder attribute to load into.")
+        payload = _load_checkpoint_payload(guide_ckpt, device=device)
+        state_dict = _extract_state_dict(payload)
+        state_dict = _prepare_component_state_dict(
+            state_dict,
+            prefixes=[
+                "guide_encoder.",
+                "model.guide_encoder.",
+                "module.guide_encoder.",
+                "stage2_sed.",
+                "stage2_sed_guide.",
+                "module.stage2_sed.",
+            ],
+        )
+        strict = bool(args.get("pretrained_guide_strict", False))
+        incompatible = guide_module.load_state_dict(state_dict, strict=strict)
+        print(f"Loaded external guide checkpoint: {guide_ckpt}")
+        _print_incompatible("[guide]", incompatible)
 
 
 # -----------------------------------------------------------------------------
@@ -130,6 +254,18 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--dev_train_path", type=str, default="/home/user/PSC/ASD/2026/data/dev_train.csv")
     parser.add_argument("--noise_csv_path", type=str, default=None)
     parser.add_argument("--finetune_from", type=str, default=None, help="Experiment name to load before training")
+
+    # External pretrained initialization (actual transfer learning entrypoints)
+    parser.add_argument("--pretrained_sep_ckpt", type=str, default=None,
+                        help="External separator checkpoint path (e.g. AudioSep-style checkpoint)")
+    parser.add_argument("--pretrained_sep_strict_backbone", default=False, action=argparse.BooleanOptionalAction,
+                        help="Use strict loading for external separator backbone")
+    parser.add_argument("--pretrained_guide_ckpt", type=str, default=None,
+                        help="External stage2 guide / SED checkpoint path")
+    parser.add_argument("--pretrained_guide_strict", default=False, action=argparse.BooleanOptionalAction,
+                        help="Use strict loading for external guide encoder")
+    parser.add_argument("--load_external_pretrained_in_driver", default=True, action=argparse.BooleanOptionalAction,
+                        help="Load external component checkpoints in train_sep.py before fit/test/validate")
 
     # Training
     parser.add_argument("--seed", type=int, default=21208)
@@ -162,6 +298,11 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--filter_normal_only", default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--return_realized_snr", default=True, action=argparse.BooleanOptionalAction)
+
+    # Optional guide-conditioning dataset controls
+    parser.add_argument("--guide_class_mode", type=str, default="machine")
+    parser.add_argument("--guide_return_reference_wave", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--guide_reference_strategy", type=str, default="same_class_random")
 
     # Raw extraction dataset
     parser.add_argument("--extract_segment_seconds", type=float, default=None)
@@ -196,6 +337,58 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--sep_return_all_encoder_features", default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--sep_return_decoder_features", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--sep_asd_feature_source", type=str, default="encoder_bottleneck")
+
+    # Stage-2 guide / SED branch
+    parser.add_argument("--use_stage2_sed", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--guide_input_channels", type=int, default=1)
+    parser.add_argument("--guide_num_classes", type=int, default=1)
+    parser.add_argument("--guide_default_class_index", type=int, default=0)
+    parser.add_argument("--guide_stem_channels", type=int, default=64)
+    parser.add_argument("--guide_hidden_dim", type=int, default=256)
+    parser.add_argument("--guide_num_layers", type=int, default=4)
+    parser.add_argument("--guide_num_heads", type=int, default=4)
+    parser.add_argument("--guide_mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--guide_dropout", type=float, default=0.1)
+    parser.add_argument("--guide_temporal_conv_kernel_size", type=int, default=3)
+    parser.add_argument("--guide_max_time_positions", type=int, default=2048)
+    parser.add_argument("--guide_use_frequency_attention_pool", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--guide_return_all_hidden_states", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--guide_strong_activation", type=str, default="sigmoid")
+
+    # Conditioning / latent injection / Time-FiLM
+    parser.add_argument("--use_time_film", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--time_film_condition_dim", type=int, default=1)
+    parser.add_argument("--time_film_hidden_dim", type=int, default=128)
+    parser.add_argument("--time_film_num_layers", type=int, default=2)
+    parser.add_argument("--time_film_dropout", type=float, default=0.0)
+    parser.add_argument("--time_film_on_bottleneck", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--time_film_on_decoder", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--time_film_residual_gamma", default=True, action=argparse.BooleanOptionalAction)
+
+    parser.add_argument("--use_latent_injection", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--latent_injection_input_dim", type=int, default=None)
+    parser.add_argument("--latent_injection_hidden_dim", type=int, default=128)
+    parser.add_argument("--latent_injection_num_hidden_states", type=int, default=None)
+
+    # DPRNN
+    parser.add_argument("--use_dprnn", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--dprnn_hidden_size", type=int, default=256)
+    parser.add_argument("--dprnn_num_layers", type=int, default=1)
+    parser.add_argument("--dprnn_dropout", type=float, default=0.0)
+    parser.add_argument("--dprnn_rnn_type", type=str, default="gru", choices=["gru", "lstm"])
+    parser.add_argument("--dprnn_bidirectional", default=True, action=argparse.BooleanOptionalAction)
+
+    # Iterative refinement
+    parser.add_argument("--use_iterative_refinement", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--refinement_num_iterations", type=int, default=2)
+    parser.add_argument("--refinement_channels", type=int, default=1)
+    parser.add_argument("--refinement_adapter_hidden_channels", type=int, default=None)
+    parser.add_argument("--refinement_adapter_num_layers", type=int, default=1)
+    parser.add_argument("--refinement_adapter_activation", type=str, default="relu")
+    parser.add_argument("--refinement_detach_between_iterations", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--refinement_residual_to_base_input", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--refinement_return_history", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--refinement_signal_key", type=str, default="pred_spec")
 
     # Feature head
     parser.add_argument("--feature_pooling", type=str, default="mean")
@@ -249,10 +442,12 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--recipe", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--code_test", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--team_name", type=str, default="default_team")
+    parser.add_argument("--decision_percentile", type=float, default=95.0)
     parser.add_argument(
         "--evaluator_output_root",
         type=str,
-        default="/home/user/PSC/work/ASD/2026/dcase2025_task2_evaluator/teams",
+        default="/home/user/PSC/ASD/2026/dcase2025_task2_evaluator/teams",
     )
     return parser
 
@@ -266,7 +461,6 @@ def _parse_encoder_channels(text_or_value: Any):
     if not text:
         return (32, 64, 128)
     return tuple(int(tok.strip()) for tok in text.split(",") if tok.strip())
-
 
 
 def get_args() -> dict:
@@ -308,6 +502,11 @@ if __name__ == "__main__":
     model = ssmodule_sep(**args)
 
     device = f"cuda:{str(args['devices']).split(',')[0].strip()}" if torch.cuda.is_available() else "cpu"
+
+    # External component initialization happens after model construction so that
+    # actual pretrained transfer can be enabled independently of --finetune_from.
+    if bool(args.get("load_external_pretrained_in_driver", True)):
+        maybe_load_external_pretrained_components(model, args, device=device)
 
     if args["train"]:
         if args["finetune_from"] is not None:

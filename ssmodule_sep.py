@@ -1,28 +1,17 @@
 """Lightning module for source-separation proxy training and ASD scoring.
 
-This module is the separation-based counterpart of the original ``ssmodule.py``.
-It keeps the project workflow familiar while changing the core proxy task:
+This version extends the original separation-based module with hooks for the
+DCASE 2025 Task 4 2nd-place team's ideas:
+
+1. optional stage-2 SED / guide encoder
+2. optional Time-FiLM conditioning and hidden-state injection
+3. optional iterative refinement wrapper
+4. optional external pretrained separator loading (e.g. AudioSep-style ckpt)
+
+It is written to stay backward-compatible with the original simplified setup:
 
     synthetic mixture -> separator training -> separator feature extraction
     -> Mahalanobis anomaly scoring
-
-Design goals
-------------
-1. Train a separator on ``(mix_wave, target_wave)`` pairs from
-   ``SeparationDataset``.
-2. Use the trained separator + ``SeparatorFeatureHead`` to extract embeddings
-   from original waveforms.
-3. Score validation / test samples with Mahalanobis distance using a normal
-   train feature bank.
-4. Save top-k checkpoints in the same style as the existing project.
-
-Recommended first configuration
--------------------------------
-- separator backbone: ResUNet
-- frontend input/target representation: magnitude
-- output_mode: mask
-- loss: L1(spec) + 0.1 * neg-SI-SDR
-- scorer: Mahalanobis distance
 """
 
 from __future__ import annotations
@@ -30,7 +19,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -49,7 +38,13 @@ from model.data.separation_dataset import SeparationDataset, separation_collate_
 from model.data.raw_wave_dataset import RawWaveDataset, raw_wave_collate_fn
 from model.separator.frontend import STFTFrontend, FrontendConfig
 from model.separator.resunet_separator import ResUNetSeparator, ResUNetSeparatorConfig
+from model.separator.stage2_sed import Stage2SEDConfig, Stage2SEDGuideEncoder
+from model.separator.conditioning import gather_class_probability_map
 from model.separator.feature_head import SeparatorFeatureHead, FeatureHeadConfig
+from model.separator.iterative_refinement import (
+    IterativeRefinementConfig,
+    IterativeRefinementWrapper,
+)
 from model.utils.sep_loss import SeparationLoss, SeparationLossConfig, build_default_separator_loss
 from model.utils.sep_metric import (
     SeparationMetricConfig,
@@ -64,33 +59,24 @@ from model.utils.feature_bank import FeatureBank, FeatureBankAccumulator
 class ssmodule_sep(pl.LightningModule):
     """Source-separation proxy LightningModule for ASD.
 
-    Expected high-level kwargs
-    --------------------------
-    Data:
-    - train_path
-    - val_path
-    - test_path
-    - dev_train_path
+    Additional high-level kwargs in this extended version
+    -----------------------------------------------------
+    Pretrained / transfer:
+    - pretrained_sep_ckpt
+    - pretrained_sep_strict_backbone
+    - pretrained_sep_strip_prefixes
 
-    Training:
-    - batch_size, num_workers, epochs
-    - optimizer, scheduler, max_lr, min_lr, warmup_epochs, restart_period, ...
+    Guide encoder / conditioning:
+    - use_stage2_sed
+    - guide_num_classes
+    - guide_default_class_index
+    - use_time_film
+    - use_latent_injection
 
-    Separation dataset:
-    - sample_rate
-    - segment_seconds
-    - snr_min_db, snr_max_db
-    - interference_mode
-    - noise_csv_path (optional)
-
-    Scoring:
-    - md_regularization
-    - md_covariance_type
-    - md_domain_strategy
-    - max_fpr
-
-    The module is intentionally permissive and fills many defaults when the
-    separation-specific arguments are not provided.
+    Iterative refinement:
+    - use_iterative_refinement
+    - refinement_num_iterations
+    - refinement_detach_between_iterations
     """
 
     def __init__(self, **kwargs) -> None:
@@ -102,11 +88,16 @@ class ssmodule_sep(pl.LightningModule):
         # Core components
         # ------------------------------------------------------------------
         self.frontend = self._build_frontend()
+        self.guide_encoder = self._build_guide_encoder()
         self.separator = self._build_separator()
         self.feature_head = self._build_feature_head()
         self.loss_fn = self._build_loss()
         self.metric_cfg = self._build_metric_config()
         self.metric_tracker = SeparationMetricTracker()
+
+        self.pretrained_load_info: Dict[str, Any] = {}
+        self._maybe_load_pretrained_separator()
+        self._maybe_load_pretrained_guide_encoder()
 
         # ------------------------------------------------------------------
         # Runtime buffers / accumulators
@@ -145,7 +136,35 @@ class ssmodule_sep(pl.LightningModule):
         )
         return STFTFrontend(cfg)
 
-    def _build_separator(self) -> ResUNetSeparator:
+    def _use_guide_encoder(self) -> bool:
+        return bool(
+            self.kwargs.get("use_stage2_sed", False)
+            or self.kwargs.get("use_time_film", False)
+            or self.kwargs.get("use_latent_injection", False)
+        )
+
+    def _build_guide_encoder(self) -> Optional[Stage2SEDGuideEncoder]:
+        if not self._use_guide_encoder():
+            return None
+
+        guide_cfg = Stage2SEDConfig(
+            num_classes=int(self.kwargs.get("guide_num_classes", 1)),
+            input_channels=int(self.kwargs.get("guide_input_channels", 1)),
+            stem_channels=int(self.kwargs.get("guide_stem_channels", 64)),
+            hidden_dim=int(self.kwargs.get("guide_hidden_dim", 256)),
+            num_layers=int(self.kwargs.get("guide_num_layers", 4)),
+            num_heads=int(self.kwargs.get("guide_num_heads", 8)),
+            mlp_ratio=float(self.kwargs.get("guide_mlp_ratio", 4.0)),
+            dropout=float(self.kwargs.get("guide_dropout", 0.1)),
+            max_time_positions=int(self.kwargs.get("guide_max_time_positions", 4096)),
+            use_frequency_attention_pool=bool(self.kwargs.get("guide_use_frequency_attention_pool", True)),
+            temporal_conv_kernel_size=int(self.kwargs.get("guide_temporal_conv_kernel_size", 5)),
+            return_all_hidden_states=bool(self.kwargs.get("guide_return_all_hidden_states", True)),
+            strong_activation=str(self.kwargs.get("guide_strong_activation", "sigmoid")),
+        )
+        return Stage2SEDGuideEncoder(guide_cfg)
+
+    def _build_separator(self) -> torch.nn.Module:
         sep_cfg = ResUNetSeparatorConfig(
             in_channels=int(self.kwargs.get("sep_in_channels", 1)),
             encoder_channels=tuple(self.kwargs.get("sep_encoder_channels", (32, 64, 128))),
@@ -161,8 +180,44 @@ class ssmodule_sep(pl.LightningModule):
             return_all_encoder_features=bool(self.kwargs.get("sep_return_all_encoder_features", True)),
             return_decoder_features=bool(self.kwargs.get("sep_return_decoder_features", False)),
             asd_feature_source=str(self.kwargs.get("sep_asd_feature_source", "encoder_bottleneck")),
+            use_dprnn=bool(self.kwargs.get("use_dprnn", False)),
+            dprnn_hidden_size=int(self.kwargs.get("dprnn_hidden_size", 256)),
+            dprnn_num_layers=int(self.kwargs.get("dprnn_num_layers", 2)),
+            dprnn_dropout=float(self.kwargs.get("dprnn_dropout", 0.0)),
+            dprnn_bidirectional=bool(self.kwargs.get("dprnn_bidirectional", True)),
+            dprnn_rnn_type=str(self.kwargs.get("dprnn_rnn_type", "gru")),
+            use_time_film=bool(self.kwargs.get("use_time_film", False)),
+            time_film_on_bottleneck=bool(self.kwargs.get("time_film_on_bottleneck", True)),
+            time_film_on_decoder=bool(self.kwargs.get("time_film_on_decoder", False)),
+            time_film_condition_dim=int(self.kwargs.get("time_film_condition_dim", 1)),
+            time_film_hidden_dim=int(self.kwargs.get("time_film_hidden_dim", 128)),
+            time_film_num_layers=int(self.kwargs.get("time_film_num_layers", 2)),
+            time_film_dropout=float(self.kwargs.get("time_film_dropout", 0.0)),
+            time_film_residual_gamma=bool(self.kwargs.get("time_film_residual_gamma", True)),
+            use_latent_injection=bool(self.kwargs.get("use_latent_injection", False)),
+            latent_injection_input_dim=int(self.kwargs.get("latent_injection_input_dim", 256)),
+            latent_injection_hidden_dim=int(self.kwargs.get("latent_injection_hidden_dim", 256)),
+            latent_injection_num_hidden_states=int(self.kwargs.get("latent_injection_num_hidden_states", 4)),
         )
-        return ResUNetSeparator(sep_cfg)
+        separator: torch.nn.Module = ResUNetSeparator(sep_cfg)
+
+        if bool(self.kwargs.get("use_iterative_refinement", False)):
+            refinement_cfg = IterativeRefinementConfig(
+                enabled=True,
+                num_iterations=int(self.kwargs.get("refinement_num_iterations", 2)),
+                detach_between_iterations=bool(self.kwargs.get("refinement_detach_between_iterations", True)),
+                base_input_channels=int(self.kwargs.get("sep_in_channels", 1)),
+                refinement_channels=int(self.kwargs.get("refinement_channels", 1)),
+                refinement_signal_key=str(self.kwargs.get("refinement_signal_key", "pred_spec")),
+                adapter_hidden_channels=int(self.kwargs.get("refinement_adapter_hidden_channels", 16)),
+                adapter_num_layers=int(self.kwargs.get("refinement_adapter_num_layers", 2)),
+                adapter_activation=str(self.kwargs.get("refinement_adapter_activation", "silu")),
+                residual_to_base_input=bool(self.kwargs.get("refinement_residual_to_base_input", True)),
+                return_history=bool(self.kwargs.get("refinement_return_history", False)),
+            )
+            separator = IterativeRefinementWrapper(separator=separator, config=refinement_cfg)
+
+        return separator
 
     def _build_feature_head(self) -> SeparatorFeatureHead:
         head_cfg = FeatureHeadConfig(
@@ -220,6 +275,69 @@ class ssmodule_sep(pl.LightningModule):
                 detach=bool(self.kwargs.get("metric_detach", True)),
             )
         return build_default_separator_metric_config()
+
+    # ------------------------------------------------------------------
+    # Pretrained loading helpers
+    # ------------------------------------------------------------------
+    def _unwrap_base_separator(self) -> ResUNetSeparator:
+        separator = self.separator
+        if isinstance(separator, IterativeRefinementWrapper):
+            separator = separator.separator
+        if not isinstance(separator, ResUNetSeparator):
+            raise TypeError(f"Expected base separator to be ResUNetSeparator, got {type(separator)!r}")
+        return separator
+
+    @staticmethod
+    def _load_checkpoint_payload(checkpoint_path: Union[str, os.PathLike]) -> Mapping[str, Any]:
+        ckpt = torch.load(str(checkpoint_path), map_location="cpu")
+        if isinstance(ckpt, Mapping):
+            return ckpt
+        raise TypeError(f"Checkpoint must load to a mapping, got {type(ckpt)!r}")
+
+    @staticmethod
+    def _extract_state_dict_from_checkpoint(ckpt: Mapping[str, Any]) -> Mapping[str, torch.Tensor]:
+        for key in ("state_dict", "model_state_dict", "model", "separator_state_dict"):
+            value = ckpt.get(key, None)
+            if isinstance(value, Mapping):
+                return value
+        return ckpt  # raw state_dict case
+
+    def _maybe_load_pretrained_separator(self) -> None:
+        ckpt_path = self.kwargs.get("pretrained_sep_ckpt", None)
+        if not ckpt_path:
+            return
+
+        ckpt = self._load_checkpoint_payload(ckpt_path)
+        state_dict = self._extract_state_dict_from_checkpoint(ckpt)
+        base_separator = self._unwrap_base_separator()
+        load_info = base_separator.load_pretrained_separator_state_dict(
+            state_dict=state_dict,
+            strict_backbone=bool(self.kwargs.get("pretrained_sep_strict_backbone", False)),
+            strip_prefixes=tuple(
+                self.kwargs.get(
+                    "pretrained_sep_strip_prefixes",
+                    ("separator.", "model.separator.", "module.separator.", "module."),
+                )
+            ),
+        )
+        load_info["checkpoint_path"] = str(ckpt_path)
+        self.pretrained_load_info["separator"] = load_info
+
+    def _maybe_load_pretrained_guide_encoder(self) -> None:
+        if self.guide_encoder is None:
+            return
+        ckpt_path = self.kwargs.get("pretrained_guide_ckpt", None)
+        if not ckpt_path:
+            return
+
+        ckpt = self._load_checkpoint_payload(ckpt_path)
+        state_dict = self._extract_state_dict_from_checkpoint(ckpt)
+        incompatible = self.guide_encoder.load_state_dict(state_dict, strict=bool(self.kwargs.get("pretrained_guide_strict", False)))
+        self.pretrained_load_info["guide_encoder"] = {
+            "checkpoint_path": str(ckpt_path),
+            "missing_keys": list(incompatible.missing_keys),
+            "unexpected_keys": list(incompatible.unexpected_keys),
+        }
 
     # ------------------------------------------------------------------
     # Dataloaders
@@ -327,10 +445,95 @@ class ssmodule_sep(pl.LightningModule):
                 out[key] = float(value)
         return out
 
-    def _run_separator(self, mix_wave: torch.Tensor) -> Dict[str, Any]:
+    def _resolve_batch_class_index(self, batch: Optional[Mapping[str, Any]], batch_size: int, device: torch.device) -> Optional[Union[int, torch.Tensor]]:
+        if not self._use_guide_encoder():
+            return None
+
+        candidate_keys = (
+            "target_class_index",
+            "class_index",
+            "guide_class_index",
+            "target_machine_index",
+            "machine_index",
+        )
+        if batch is not None:
+            for key in candidate_keys:
+                if key not in batch:
+                    continue
+                value = batch[key]
+                if torch.is_tensor(value):
+                    value = value.to(device=device)
+                    if value.ndim == 0:
+                        return int(value.item())
+                    if value.ndim == 1 and value.shape[0] == batch_size:
+                        return value.long()
+                elif isinstance(value, (int, np.integer)):
+                    return int(value)
+                elif isinstance(value, (list, tuple)) and len(value) == batch_size:
+                    return torch.as_tensor(value, dtype=torch.long, device=device)
+
+        default_index = int(self.kwargs.get("guide_default_class_index", 0))
+        num_classes = int(self.kwargs.get("guide_num_classes", 1))
+        if num_classes == 1:
+            return 0
+        return default_index
+
+    def _compute_separator_guidance(
+        self,
+        mix_spec: torch.Tensor,
+        batch: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if self.guide_encoder is None:
+            return {
+                "guide_out": None,
+                "time_condition": None,
+                "hidden_states": None,
+                "class_index": None,
+            }
+
+        guide_out = self.guide_encoder(mix_spec)
+        batch_size = mix_spec.shape[0]
+        class_index = self._resolve_batch_class_index(batch=batch, batch_size=batch_size, device=mix_spec.device)
+
+        time_condition = None
+        if bool(self.kwargs.get("use_time_film", False)):
+            strong_probabilities = guide_out["strong_probabilities"]
+            if class_index is None:
+                if strong_probabilities.shape[1] == 1:
+                    time_condition = strong_probabilities[:, :1, :]
+                else:
+                    raise ValueError(
+                        "use_time_film=True requires a target class index when guide_num_classes > 1."
+                    )
+            else:
+                time_condition = gather_class_probability_map(strong_probabilities, class_index)
+
+        hidden_states = None
+        if bool(self.kwargs.get("use_latent_injection", False)):
+            hidden_states = guide_out.get("hidden_states", None)
+
+        return {
+            "guide_out": guide_out,
+            "time_condition": time_condition,
+            "hidden_states": hidden_states,
+            "class_index": class_index,
+        }
+
+    def _run_separator(self, mix_wave: torch.Tensor, batch: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         mix_spec, mix_aux = self.frontend.wave_to_input_spec(mix_wave)
-        sep_out = self.separator(mix_spec)
+        guidance = self._compute_separator_guidance(mix_spec=mix_spec, batch=batch)
+        sep_out = self.separator(
+            mix_spec,
+            time_condition=guidance["time_condition"],
+            hidden_states=guidance["hidden_states"],
+        )
+        if not isinstance(sep_out, dict):
+            raise TypeError(f"separator must return a dict, got {type(sep_out)!r}")
         sep_out["mix_aux"] = mix_aux
+        if guidance["guide_out"] is not None:
+            sep_out["guide_out"] = guidance["guide_out"]
+            sep_out["guide_time_condition"] = guidance["time_condition"]
+            sep_out["guide_class_index"] = guidance["class_index"]
         return sep_out
 
     def _prepare_train_batch(self, batch: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
@@ -351,9 +554,14 @@ class ssmodule_sep(pl.LightningModule):
             return None
         return self.frontend.make_target_mask(mix_wave, target_wave)
 
-    def _extract_embedding_tensor(self, wave: torch.Tensor) -> torch.Tensor:
+    def _extract_embedding_tensor(self, wave: torch.Tensor, batch: Optional[Mapping[str, Any]] = None) -> torch.Tensor:
         input_spec, _ = self.frontend.wave_to_input_spec(wave)
-        sep_out = self.separator(input_spec)
+        guidance = self._compute_separator_guidance(mix_spec=input_spec, batch=batch)
+        sep_out = self.separator(
+            input_spec,
+            time_condition=guidance["time_condition"],
+            hidden_states=guidance["hidden_states"],
+        )
         head_out = self.feature_head(sep_out)
         return head_out["embedding"]
 
@@ -363,14 +571,13 @@ class ssmodule_sep(pl.LightningModule):
 
         if torch.is_tensor(wave):
             wave = wave.to(self.device, non_blocking=True)
-            emb = self._extract_embedding_tensor(wave)
+            emb = self._extract_embedding_tensor(wave, batch=batch)
             return emb, metadata
 
-        # Variable-length case: wave is a list of [1, T] tensors.
         embeddings: List[torch.Tensor] = []
         for item in wave:
             item = item.to(self.device, non_blocking=True)
-            emb = self._extract_embedding_tensor(item.unsqueeze(0) if item.ndim == 2 else item)
+            emb = self._extract_embedding_tensor(item.unsqueeze(0) if item.ndim == 2 else item, batch=batch)
             embeddings.append(emb)
         return torch.cat(embeddings, dim=0), metadata
 
@@ -379,6 +586,8 @@ class ssmodule_sep(pl.LightningModule):
         self.separator.eval()
         self.feature_head.eval()
         self.frontend.eval()
+        if self.guide_encoder is not None:
+            self.guide_encoder.eval()
 
         with torch.no_grad():
             for batch in loader:
@@ -429,14 +638,18 @@ class ssmodule_sep(pl.LightningModule):
     # Lightning steps
     # ------------------------------------------------------------------
     def forward(self, mix_wave: torch.Tensor) -> Dict[str, Any]:
-        return self._run_separator(mix_wave)
+        return self._run_separator(mix_wave, batch=None)
+
+    def on_fit_start(self) -> None:
+        if self.trainer.is_global_zero and self.pretrained_load_info:
+            print("[pretrained_load_info]", self.pretrained_load_info)
 
     def training_step(self, batch: Mapping[str, Any], batch_idx: int) -> torch.Tensor:
         tensors = self._prepare_train_batch(batch)
         mix_wave = tensors["mix_wave"]
         target_wave = tensors["target_wave"]
 
-        sep_out = self._run_separator(mix_wave)
+        sep_out = self._run_separator(mix_wave, batch=batch)
         target_spec = self.frontend.wave_to_target_spec(target_wave)
         pred_wave = self.frontend.pred_spec_to_wave(
             sep_out["pred_spec"],
@@ -523,6 +736,21 @@ class ssmodule_sep(pl.LightningModule):
             max_fpr=max_fpr,
         )
 
+        val_scores = compute_result_md(
+            result_train=train_bank.embeddings,
+            result_test=val_bank.embeddings,
+            regularization=regularization,
+            covariance_type=covariance_type,
+            domain_strategy=domain_strategy,
+            train_metadata=train_bank.metadata,
+            test_metadata=val_bank.metadata,
+            test=True,
+        )
+        decision_thresholds = self._compute_labeled_thresholds(
+            metadata=val_bank.metadata,
+            anomaly_scores=val_scores,
+        )
+
         self.log("mean_AUC_source", mean_auc_source, add_dataloader_idx=False, sync_dist=True, prog_bar=True)
         self.log("mean_AUC_target", mean_auc_target, add_dataloader_idx=False, sync_dist=True)
         self.log("mean_pAUC", mean_p_auc, add_dataloader_idx=False, sync_dist=True)
@@ -534,6 +762,7 @@ class ssmodule_sep(pl.LightningModule):
                 "covariance_type": covariance_type,
                 "domain_strategy": domain_strategy,
                 "machine_results": machine_results,
+                "decision_thresholds": decision_thresholds,
             }
             self.update_best_checkpoints(float(final_score))
 
@@ -555,16 +784,39 @@ class ssmodule_sep(pl.LightningModule):
         test_bank = self._gather_feature_bank(test_bank_local)
         train_bank = self._train_feature_bank()
 
+        regularization = float(self.md_best_state.get("regularization", self.kwargs.get("md_regularization", 1e-5)))
+        covariance_type = str(self.md_best_state.get("covariance_type", self.kwargs.get("md_covariance_type", "full")))
+        domain_strategy = str(self.md_best_state.get("domain_strategy", self.kwargs.get("md_domain_strategy", "source_target_min")))
+
         anomaly_scores = compute_result_md(
             result_train=train_bank.embeddings,
             result_test=test_bank.embeddings,
-            regularization=float(self.md_best_state.get("regularization", self.kwargs.get("md_regularization", 1e-5))),
-            covariance_type=str(self.md_best_state.get("covariance_type", self.kwargs.get("md_covariance_type", "full"))),
-            domain_strategy=str(self.md_best_state.get("domain_strategy", self.kwargs.get("md_domain_strategy", "source_target_min"))),
+            regularization=regularization,
+            covariance_type=covariance_type,
+            domain_strategy=domain_strategy,
             train_metadata=train_bank.metadata,
             test_metadata=test_bank.metadata,
             test=True,
         )
+
+        decision_thresholds = self.md_best_state.get("decision_thresholds", None)
+        if not decision_thresholds:
+            train_scores = compute_result_md(
+                result_train=train_bank.embeddings,
+                result_test=train_bank.embeddings,
+                regularization=regularization,
+                covariance_type=covariance_type,
+                domain_strategy=domain_strategy,
+                train_metadata=train_bank.metadata,
+                test_metadata=train_bank.metadata,
+                test=True,
+            )
+            decision_thresholds = self._compute_percentile_thresholds(
+                metadata=train_bank.metadata,
+                anomaly_scores=train_scores,
+                percentile=float(self.kwargs.get("decision_percentile", os.getenv("DECISION_PERCENTILE", 95.0))),
+            )
+            self.md_best_state["decision_thresholds"] = decision_thresholds
 
         mean_score = float(np.mean(anomaly_scores))
         num_samples = float(len(test_bank))
@@ -573,35 +825,246 @@ class ssmodule_sep(pl.LightningModule):
         self.log("mean_anomaly_score", mean_score, add_dataloader_idx=False, sync_dist=True, prog_bar=True)
 
         if self.trainer.is_global_zero:
-            self._save_test_outputs(test_bank.metadata.copy(), anomaly_scores)
+            self._save_test_outputs(
+                metadata=test_bank.metadata.copy(),
+                anomaly_scores=anomaly_scores,
+                decision_thresholds=decision_thresholds,
+            )
 
         return {"num_test_samples": num_samples, "mean_anomaly_score": mean_score}
 
     # ------------------------------------------------------------------
     # Saving helpers
     # ------------------------------------------------------------------
-    def _save_test_outputs(self, metadata: pd.DataFrame, anomaly_scores: np.ndarray) -> None:
+    @staticmethod
+    def _labels_to_binary(labels: pd.Series) -> np.ndarray:
+        lowered = labels.astype(str).str.lower()
+        mapped = lowered.map({"normal": 0, "anomaly": 1})
+        if mapped.notna().all():
+            return mapped.to_numpy(dtype=np.int64)
+        return pd.to_numeric(labels, errors="raise").to_numpy(dtype=np.int64)
+
+    @staticmethod
+    def _find_best_f1_threshold(scores: np.ndarray, labels: np.ndarray) -> float:
+        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+
+        if scores.size == 0:
+            return 0.0
+
+        candidates = np.unique(scores)
+        candidates = np.concatenate([candidates, [float(candidates.max() + 1e-6)]])
+
+        eps = 1e-12
+        best_thr = float(candidates[0])
+        best_f1 = -1.0
+
+        for thr in candidates:
+            pred = (scores >= thr).astype(np.int64)
+            tp = int(np.sum((pred == 1) & (labels == 1)))
+            fp = int(np.sum((pred == 1) & (labels == 0)))
+            fn = int(np.sum((pred == 0) & (labels == 1)))
+
+            prec = tp / max(tp + fp, eps)
+            rec = tp / max(tp + fn, eps)
+            f1 = 2.0 * prec * rec / max(prec + rec, eps)
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thr = float(thr)
+
+        return best_thr
+
+    def _compute_labeled_thresholds(
+        self,
+        metadata: pd.DataFrame,
+        anomaly_scores: np.ndarray,
+    ) -> Dict[str, Any]:
+        df = metadata.reset_index(drop=True).copy()
+        df["anomaly_score"] = np.asarray(anomaly_scores, dtype=np.float32)
+        df["machine"] = df["machine"].astype(str)
+        if "domain" in df.columns:
+            df["domain"] = df["domain"].astype(str).str.lower()
+
+        df["label_bin"] = self._labels_to_binary(df["label"])
+
+        thresholds: Dict[str, Any] = {
+            "global": self._find_best_f1_threshold(df["anomaly_score"].to_numpy(), df["label_bin"].to_numpy()),
+            "per_machine": {},
+            "per_machine_domain": {},
+        }
+
+        for machine, mdf in df.groupby("machine"):
+            thresholds["per_machine"][machine] = self._find_best_f1_threshold(
+                mdf["anomaly_score"].to_numpy(),
+                mdf["label_bin"].to_numpy(),
+            )
+
+            if "domain" in mdf.columns:
+                thresholds["per_machine_domain"][machine] = {}
+                for domain, ddf in mdf.groupby("domain"):
+                    thresholds["per_machine_domain"][machine][domain] = self._find_best_f1_threshold(
+                        ddf["anomaly_score"].to_numpy(),
+                        ddf["label_bin"].to_numpy(),
+                    )
+
+        return thresholds
+
+    def _compute_percentile_thresholds(
+        self,
+        metadata: pd.DataFrame,
+        anomaly_scores: np.ndarray,
+        percentile: float,
+    ) -> Dict[str, Any]:
+        df = metadata.reset_index(drop=True).copy()
+        df["anomaly_score"] = np.asarray(anomaly_scores, dtype=np.float32)
+        df["machine"] = df["machine"].astype(str)
+        if "domain" in df.columns:
+            df["domain"] = df["domain"].astype(str).str.lower()
+
+        thresholds: Dict[str, Any] = {
+            "global": float(np.percentile(df["anomaly_score"].to_numpy(), percentile)),
+            "per_machine": {},
+            "per_machine_domain": {},
+        }
+
+        for machine, mdf in df.groupby("machine"):
+            thresholds["per_machine"][machine] = float(
+                np.percentile(mdf["anomaly_score"].to_numpy(), percentile)
+            )
+
+            if "domain" in mdf.columns:
+                thresholds["per_machine_domain"][machine] = {}
+                for domain, ddf in mdf.groupby("domain"):
+                    thresholds["per_machine_domain"][machine][domain] = float(
+                        np.percentile(ddf["anomaly_score"].to_numpy(), percentile)
+                    )
+
+        return thresholds
+
+    @staticmethod
+    def _resolve_decision_threshold(
+        machine: str,
+        domain: Optional[str],
+        thresholds: Mapping[str, Any],
+    ) -> float:
+        if not isinstance(thresholds, Mapping):
+            return 0.0
+
+        per_machine_domain = thresholds.get("per_machine_domain", {})
+        if domain is not None:
+            domain = str(domain).lower()
+            if machine in per_machine_domain and domain in per_machine_domain[machine]:
+                return float(per_machine_domain[machine][domain])
+
+        per_machine = thresholds.get("per_machine", {})
+        if machine in per_machine:
+            return float(per_machine[machine])
+
+        if "global" in thresholds:
+            return float(thresholds["global"])
+
+        return 0.0
+
+    def _resolve_evaluator_root(self) -> Path:
+        legacy_default = "/home/user/PSC/ASD/2026/dcase2025_task2_evaluator/teams"
+        repo_default = PROJECT_ROOT / "dcase2025_task2_evaluator" / "teams"
+        modern_default = Path("/home/user/PSC/ASD/2026/dcase2025_task2_evaluator/teams")
+
+        env_root = os.getenv("EVALUATOR_OUTPUT_ROOT")
+        if env_root:
+            return Path(env_root)
+
+        kw_root = self.kwargs.get("evaluator_output_root", None)
+        if kw_root:
+            kw_root_path = Path(str(kw_root))
+            if str(kw_root_path) != legacy_default:
+                return kw_root_path
+
+        if repo_default.exists():
+            return repo_default
+
+        if modern_default.exists():
+            return modern_default
+
+        if kw_root:
+            return Path(str(kw_root))
+
+        return modern_default
+
+    def _resolve_team_name(self) -> str:
+        return str(
+            self.kwargs.get("team_name")
+            or os.getenv("TEAM_NAME")
+            or "default_team"
+        )
+
+    def _save_test_outputs(
+        self,
+        metadata: pd.DataFrame,
+        anomaly_scores: np.ndarray,
+        decision_thresholds: Mapping[str, Any],
+    ) -> None:
         metadata = metadata.reset_index(drop=True).copy()
         metadata["anomaly_score"] = np.asarray(anomaly_scores, dtype=np.float32)
 
         basename_col = metadata["audio_path"].astype(str).apply(lambda x: Path(x).name)
+        domain_col = (
+            metadata["domain"].astype(str).str.lower()
+            if "domain" in metadata.columns
+            else pd.Series([""] * len(metadata), index=metadata.index)
+        )
         sub_eval = pd.DataFrame({
             "filename": basename_col,
             "anomaly_score": metadata["anomaly_score"],
             "machine": metadata["machine"].astype(str),
+            "domain": domain_col,
         })
 
-        evaluator_root = self.kwargs.get(
-            "evaluator_output_root",
-            "/home/user/PSC/work/ASD/2026/dcase2025_task2_evaluator/teams",
-        )
-        save_dir = Path(evaluator_root) / str(self.kwargs.get("exp", "sep_exp"))
+        sub_eval["decision_result"] = [
+            int(
+                score >= self._resolve_decision_threshold(
+                    machine=str(machine),
+                    domain=(None if domain == "" else str(domain)),
+                    thresholds=decision_thresholds,
+                )
+            )
+            for machine, domain, score in zip(
+                sub_eval["machine"],
+                sub_eval["domain"],
+                sub_eval["anomaly_score"],
+            )
+        ]
+
+        evaluator_root = self._resolve_evaluator_root()
+        team_name = self._resolve_team_name()
+        system_name = str(self.kwargs.get("exp", "sep_exp"))
+
+        save_dir = evaluator_root / team_name / system_name
         save_dir.mkdir(parents=True, exist_ok=True)
 
         for machine in sub_eval["machine"].unique():
-            temp = sub_eval.loc[sub_eval["machine"] == machine, ["filename", "anomaly_score"]].copy()
-            temp.to_csv(save_dir / f"anomaly_score_{machine}_section_00_test.csv", index=False, header=False)
-            temp.to_csv(save_dir / f"decision_result_{machine}_section_00_test.csv", index=False, header=False)
+            temp_score = sub_eval.loc[
+                sub_eval["machine"] == machine,
+                ["filename", "anomaly_score"],
+            ].copy()
+            temp_decision = sub_eval.loc[
+                sub_eval["machine"] == machine,
+                ["filename", "decision_result"],
+            ].copy()
+
+            temp_score.to_csv(
+                save_dir / f"anomaly_score_{machine}_section_00_test.csv",
+                index=False,
+                header=False,
+            )
+            temp_decision.to_csv(
+                save_dir / f"decision_result_{machine}_section_00_test.csv",
+                index=False,
+                header=False,
+            )
+
+        print(f"Saved evaluator CSVs to: {save_dir}")
 
     def update_best_checkpoints(self, current_score: float) -> None:
         checkpoint_dir = Path("exp1") / str(self.kwargs.get("exp", "sep_exp")) / "checkpoints"
@@ -614,6 +1077,7 @@ class ssmodule_sep(pl.LightningModule):
             "final_score": float(current_score),
             "md_state": dict(self.md_best_state),
             "hparams": dict(self.kwargs),
+            "pretrained_load_info": dict(self.pretrained_load_info),
         }
         torch.save(ckpt, checkpoint_path)
 

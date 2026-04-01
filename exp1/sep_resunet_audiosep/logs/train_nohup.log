@@ -1,0 +1,9 @@
+Seed set to 21208
+Traceback (most recent call last):
+  File "/home/user/PSC/ASD/2026/train_sep.py", line 502, in <module>
+    model = ssmodule_sep(**args)
+  File "/home/user/PSC/ASD/2026/ssmodule_sep.py", line 92, in __init__
+    self.separator = self._build_separator()
+  File "/home/user/PSC/ASD/2026/ssmodule_sep.py", line 198, in _build_separator
+    latent_injection_input_dim=int(self.kwargs.get("latent_injection_input_dim", 256)),
+TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'
