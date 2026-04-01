@@ -545,12 +545,13 @@ class ssmodule_sep(pl.LightningModule):
             embeddings, metadata = self._extract_embeddings_from_raw_batch(batch)
         self.test_feature_accumulator.append(embeddings, metadata)
 
-    def on_test_epoch_end(self) -> List[Dict[str, float]]:
+    def on_test_epoch_end(self):
         test_bank_local = self.test_feature_accumulator.finalize(
             name="test_feature_bank",
             l2_normalize=bool(self.kwargs.get("feature_bank_l2_normalize", False)),
             reset=True,
         )
+
         test_bank = self._gather_feature_bank(test_bank_local)
         train_bank = self._train_feature_bank()
 
@@ -565,10 +566,16 @@ class ssmodule_sep(pl.LightningModule):
             test=True,
         )
 
+        mean_score = float(np.mean(anomaly_scores))
+        num_samples = float(len(test_bank))
+
+        self.log("num_test_samples", num_samples, add_dataloader_idx=False, sync_dist=True)
+        self.log("mean_anomaly_score", mean_score, add_dataloader_idx=False, sync_dist=True, prog_bar=True)
+
         if self.trainer.is_global_zero:
             self._save_test_outputs(test_bank.metadata.copy(), anomaly_scores)
 
-        return [{"num_test_samples": float(len(test_bank)), "mean_anomaly_score": float(np.mean(anomaly_scores))}]
+        return {"num_test_samples": num_samples, "mean_anomaly_score": mean_score}
 
     # ------------------------------------------------------------------
     # Saving helpers
@@ -586,7 +593,7 @@ class ssmodule_sep(pl.LightningModule):
 
         evaluator_root = self.kwargs.get(
             "evaluator_output_root",
-            "/home/user/KMJ/work/ASD/2026/dcase2025_task2_evaluator/teams",
+            "/home/user/PSC/work/ASD/2026/dcase2025_task2_evaluator/teams",
         )
         save_dir = Path(evaluator_root) / str(self.kwargs.get("exp", "sep_exp"))
         save_dir.mkdir(parents=True, exist_ok=True)

@@ -252,7 +252,7 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--evaluator_output_root",
         type=str,
-        default="/home/user/KMJ/work/ASD/2026/dcase2025_task2_evaluator/teams",
+        default="/home/user/PSC/work/ASD/2026/dcase2025_task2_evaluator/teams",
     )
     return parser
 
