@@ -200,6 +200,11 @@ def maybe_load_external_pretrained_components(
                 "net.separator.",
                 "backbone.",
                 "module.backbone.",
+                "ss_model.separator.",
+                "ss_model.base.",
+                "ss_model.",
+                "model.ss_model.separator.",
+                "model.ss_model.base.",
             ],
         )
         strict = bool(args.get("pretrained_sep_strict_backbone", False))
@@ -228,6 +233,11 @@ def maybe_load_external_pretrained_components(
                 "stage2_sed.",
                 "stage2_sed_guide.",
                 "module.stage2_sed.",
+                "sed_model.",
+                "tagger_model.",
+                "model.sed_model.",
+                "model.tagger_model.",
+                "embedding_injection.tagger_model.",
             ],
         )
         strict = bool(args.get("pretrained_guide_strict", False))
@@ -256,11 +266,11 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--finetune_from", type=str, default=None, help="Experiment name to load before training")
 
     # External pretrained initialization (actual transfer learning entrypoints)
-    parser.add_argument("--pretrained_sep_ckpt", type=str, default=None,
+    parser.add_argument("--pretrained_sep_ckpt", type=str, default="/home/user/PSC/ASD/2026/checkpoints/audiosep_sed.ckpt",
                         help="External separator checkpoint path (e.g. AudioSep-style checkpoint)")
     parser.add_argument("--pretrained_sep_strict_backbone", default=False, action=argparse.BooleanOptionalAction,
                         help="Use strict loading for external separator backbone")
-    parser.add_argument("--pretrained_guide_ckpt", type=str, default=None,
+    parser.add_argument("--pretrained_guide_ckpt", type=str, default="/home/user/PSC/ASD/2026/checkpoints/m2d_sed.ckpt",
                         help="External stage2 guide / SED checkpoint path")
     parser.add_argument("--pretrained_guide_strict", default=False, action=argparse.BooleanOptionalAction,
                         help="Use strict loading for external guide encoder")
@@ -366,14 +376,14 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--time_film_residual_gamma", default=True, action=argparse.BooleanOptionalAction)
 
     parser.add_argument("--use_latent_injection", default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--latent_injection_input_dim", type=int, default=None)
+    parser.add_argument("--latent_injection_input_dim", type=int, default=256)
     parser.add_argument("--latent_injection_hidden_dim", type=int, default=128)
-    parser.add_argument("--latent_injection_num_hidden_states", type=int, default=None)
+    parser.add_argument("--latent_injection_num_hidden_states", type=int, default=4)
 
     # DPRNN
     parser.add_argument("--use_dprnn", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--dprnn_hidden_size", type=int, default=256)
-    parser.add_argument("--dprnn_num_layers", type=int, default=1)
+    parser.add_argument("--dprnn_num_layers", type=int, default=2)
     parser.add_argument("--dprnn_dropout", type=float, default=0.0)
     parser.add_argument("--dprnn_rnn_type", type=str, default="gru", choices=["gru", "lstm"])
     parser.add_argument("--dprnn_bidirectional", default=True, action=argparse.BooleanOptionalAction)
@@ -382,7 +392,7 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--use_iterative_refinement", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--refinement_num_iterations", type=int, default=2)
     parser.add_argument("--refinement_channels", type=int, default=1)
-    parser.add_argument("--refinement_adapter_hidden_channels", type=int, default=None)
+    parser.add_argument("--refinement_adapter_hidden_channels", type=int, default=16)
     parser.add_argument("--refinement_adapter_num_layers", type=int, default=1)
     parser.add_argument("--refinement_adapter_activation", type=str, default="relu")
     parser.add_argument("--refinement_detach_between_iterations", default=True, action=argparse.BooleanOptionalAction)

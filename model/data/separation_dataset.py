@@ -239,7 +239,12 @@ class SeparationDataset(Dataset):
         self.fixed_snr_db = fixed_snr_db
         self.return_realized_snr = return_realized_snr
         self.guide_class_mode = str(guide_class_mode)
+        self.guide_return_reference_wave = bool(guide_return_reference_wave)
+        self.guide_reference_strategy = str(guide_reference_strategy)
         self.guide_class_column = guide_class_column
+        self.class_to_index = self._build_class_to_index(self.df)
+        self.index_to_class = {v: k for k, v in self.class_to_index.items()}
+        self.num_classes = len(self.class_to_index)
         self.return_reference_wave = bool(return_reference_wave)
         self.reference_mode = str(reference_mode)
         self.reference_exclude_self = bool(reference_exclude_self)
@@ -354,8 +359,36 @@ class SeparationDataset(Dataset):
             item["reference_class_name"] = reference_row.guide_class_name
             item["reference_class_index"] = int(reference_row.guide_class_index)
             item["reference_row_index"] = int(reference_row.row_index)
+        
+        target_class_name = self._make_class_name(target_row)
+        target_class_index = int(self.class_to_index[target_class_name])
+
+        item.update({
+            "target_class_name": target_class_name,
+            "target_class_index": target_class_index,
+            "guide_class_index": target_class_index,
+            "class_index": target_class_index,
+            "guide_num_classes": int(self.num_classes),
+        })
 
         return item
+    
+    def _make_class_name(self, row: SeparationRow) -> str:
+        mode = self.guide_class_mode
+        if mode == "machine":
+            return str(row.machine)
+        if mode == "machine_domain":
+            return f"{row.machine}::{row.domain}"
+        if mode == "machine_attribute":
+            return f"{row.machine}::{row.attribute}"
+        return str(row.machine)
+
+    def _build_class_to_index(self, df: pd.DataFrame) -> Dict[str, int]:
+        names = sorted({
+            self._make_class_name(self._row_to_obj(row))
+            for _, row in df.iterrows()
+        })
+        return {name: idx for idx, name in enumerate(names)}
 
     @staticmethod
     def _read_main_csv(

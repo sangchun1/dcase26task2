@@ -117,6 +117,77 @@ class ssmodule_sep(pl.LightningModule):
 
         devices = str(self.kwargs.get("devices", "0"))
         self.distributed_mode = len([d for d in devices.split(",") if d.strip() != ""]) > 1
+    
+    def _norm_guide_token(self, value) -> str:
+        if value is None:
+            return "__UNK__"
+        text = str(value).strip()
+        return text if text else "__UNK__"
+
+    def _make_guide_token_from_series(self, row: pd.Series) -> str:
+        mode = str(self.kwargs.get("guide_class_mode", "machine"))
+
+        machine = self._norm_guide_token(row.get("machine", None))
+        domain = self._norm_guide_token(row.get("domain", None))
+        attribute = self._norm_guide_token(row.get("attribute", None))
+        year = self._norm_guide_token(row.get("year", None))
+
+        if mode == "machine":
+            return machine
+        if mode == "machine_domain":
+            return f"{machine}::{domain}"
+        if mode == "machine_attribute":
+            return f"{machine}::{attribute}"
+        if mode == "machine_year":
+            return f"{machine}::{year}"
+        if mode == "domain":
+            return domain
+        if mode == "attribute":
+            return attribute
+
+        # fallback
+        return machine
+
+    def _infer_guide_vocab_from_csv(self) -> Dict[str, int]:
+        csv_candidates = [
+            self.kwargs.get("train_path", None),
+            self.kwargs.get("dev_train_path", None),
+            self.kwargs.get("val_path", None),
+        ]
+        csv_path = None
+        for path in csv_candidates:
+            if path and os.path.exists(path):
+                csv_path = path
+                break
+
+        if csv_path is None:
+            return {"__DEFAULT__": 0}
+
+        df = pd.read_csv(csv_path)
+
+        if bool(self.kwargs.get("filter_normal_only", True)) and "label" in df.columns:
+            labels = df["label"].astype(str).str.lower()
+            df = df[labels != "anomaly"]
+
+        tokens = sorted({self._make_guide_token_from_series(row) for _, row in df.iterrows()})
+        if len(tokens) == 0:
+            tokens = ["__DEFAULT__"]
+
+        return {token: idx for idx, token in enumerate(tokens)}
+
+    def _get_or_build_guide_vocab(self) -> Dict[str, int]:
+        vocab = getattr(self, "_guide_vocab", None)
+        if vocab is None:
+            vocab = self._infer_guide_vocab_from_csv()
+            self._guide_vocab = vocab
+        return vocab
+
+    def _resolve_guide_num_classes(self) -> int:
+        configured = self.kwargs.get("guide_num_classes", 0)
+        if configured is not None and int(configured) > 0:
+            return int(configured)
+        vocab = self._get_or_build_guide_vocab()
+        return max(len(vocab), 1)
 
     # ------------------------------------------------------------------
     # Builders
@@ -145,13 +216,17 @@ class ssmodule_sep(pl.LightningModule):
 
     def _build_guide_encoder(self) -> Optional[Stage2SEDGuideEncoder]:
         if not self._use_guide_encoder():
+            self.guide_num_classes = 0
             return None
 
+        self.guide_num_classes = self._resolve_guide_num_classes()
+        self.kwargs["guide_num_classes"] = self.guide_num_classes
+
         guide_cfg = Stage2SEDConfig(
-            num_classes=int(self.kwargs.get("guide_num_classes", 1)),
+            num_classes=self.guide_num_classes,
             input_channels=int(self.kwargs.get("guide_input_channels", 1)),
             stem_channels=int(self.kwargs.get("guide_stem_channels", 64)),
-            hidden_dim=int(self.kwargs.get("guide_hidden_dim", 256)),
+            hidden_dim=int(self.kwargs.get("guide_hidden_dim") or 256),
             num_layers=int(self.kwargs.get("guide_num_layers", 4)),
             num_heads=int(self.kwargs.get("guide_num_heads", 8)),
             mlp_ratio=float(self.kwargs.get("guide_mlp_ratio", 4.0)),
@@ -163,6 +238,53 @@ class ssmodule_sep(pl.LightningModule):
             strong_activation=str(self.kwargs.get("guide_strong_activation", "sigmoid")),
         )
         return Stage2SEDGuideEncoder(guide_cfg)
+    
+    def _convert_single_class_value_to_index(self, value) -> int:
+        default_idx = int(self.kwargs.get("guide_default_class_index", 0))
+        vocab = self._get_or_build_guide_vocab()
+
+        if value is None:
+            return default_idx
+
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+
+        token = self._norm_guide_token(value)
+        return int(vocab.get(token, default_idx))
+
+    def _extract_safe_guide_class_index(self, batch: Dict[str, Any], batch_size: int, device: torch.device) -> torch.Tensor:
+        candidate = None
+        for key in ("guide_class_index", "target_class_index", "class_index", "target_machine_index", "machine_index", "target_machine"):
+            if key in batch:
+                candidate = batch[key]
+                break
+
+        if candidate is None:
+            idx = torch.full(
+                (batch_size,),
+                int(self.kwargs.get("guide_default_class_index", 0)),
+                dtype=torch.long,
+                device=device,
+            )
+        elif isinstance(candidate, torch.Tensor):
+            idx = candidate.to(device=device, dtype=torch.long).view(-1)
+        elif isinstance(candidate, (list, tuple)):
+            idx = torch.tensor(
+                [self._convert_single_class_value_to_index(v) for v in candidate],
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            idx = torch.full(
+                (batch_size,),
+                self._convert_single_class_value_to_index(candidate),
+                dtype=torch.long,
+                device=device,
+            )
+
+        num_classes = max(int(getattr(self, "guide_num_classes", 0) or self.kwargs.get("guide_num_classes", 1)), 1)
+        idx = idx.clamp(min=0, max=num_classes - 1)
+        return idx
 
     def _build_separator(self) -> torch.nn.Module:
         sep_cfg = ResUNetSeparatorConfig(
@@ -181,23 +303,23 @@ class ssmodule_sep(pl.LightningModule):
             return_decoder_features=bool(self.kwargs.get("sep_return_decoder_features", False)),
             asd_feature_source=str(self.kwargs.get("sep_asd_feature_source", "encoder_bottleneck")),
             use_dprnn=bool(self.kwargs.get("use_dprnn", False)),
-            dprnn_hidden_size=int(self.kwargs.get("dprnn_hidden_size", 256)),
-            dprnn_num_layers=int(self.kwargs.get("dprnn_num_layers", 2)),
+            dprnn_hidden_size=int(self.kwargs.get("dprnn_hidden_size") or 256),
+            dprnn_num_layers=int(self.kwargs.get("dprnn_num_layers") or 2),
             dprnn_dropout=float(self.kwargs.get("dprnn_dropout", 0.0)),
             dprnn_bidirectional=bool(self.kwargs.get("dprnn_bidirectional", True)),
             dprnn_rnn_type=str(self.kwargs.get("dprnn_rnn_type", "gru")),
             use_time_film=bool(self.kwargs.get("use_time_film", False)),
             time_film_on_bottleneck=bool(self.kwargs.get("time_film_on_bottleneck", True)),
             time_film_on_decoder=bool(self.kwargs.get("time_film_on_decoder", False)),
-            time_film_condition_dim=int(self.kwargs.get("time_film_condition_dim", 1)),
-            time_film_hidden_dim=int(self.kwargs.get("time_film_hidden_dim", 128)),
-            time_film_num_layers=int(self.kwargs.get("time_film_num_layers", 2)),
+            time_film_condition_dim=int(self.kwargs.get("time_film_condition_dim") or 1),
+            time_film_hidden_dim=int(self.kwargs.get("time_film_hidden_dim") or 128),
+            time_film_num_layers=int(self.kwargs.get("time_film_num_layers") or 2),
             time_film_dropout=float(self.kwargs.get("time_film_dropout", 0.0)),
             time_film_residual_gamma=bool(self.kwargs.get("time_film_residual_gamma", True)),
             use_latent_injection=bool(self.kwargs.get("use_latent_injection", False)),
-            latent_injection_input_dim=int(self.kwargs.get("latent_injection_input_dim", 256)),
-            latent_injection_hidden_dim=int(self.kwargs.get("latent_injection_hidden_dim", 256)),
-            latent_injection_num_hidden_states=int(self.kwargs.get("latent_injection_num_hidden_states", 4)),
+            latent_injection_input_dim=int(self.kwargs.get("latent_injection_input_dim") or 256),
+            latent_injection_hidden_dim=int(self.kwargs.get("latent_injection_hidden_dim") or 256),
+            latent_injection_num_hidden_states=int(self.kwargs.get("latent_injection_num_hidden_states") or 4),
         )
         separator: torch.nn.Module = ResUNetSeparator(sep_cfg)
 
@@ -207,10 +329,10 @@ class ssmodule_sep(pl.LightningModule):
                 num_iterations=int(self.kwargs.get("refinement_num_iterations", 2)),
                 detach_between_iterations=bool(self.kwargs.get("refinement_detach_between_iterations", True)),
                 base_input_channels=int(self.kwargs.get("sep_in_channels", 1)),
-                refinement_channels=int(self.kwargs.get("refinement_channels", 1)),
+                refinement_channels=int(self.kwargs.get("refinement_channels") or 1),
                 refinement_signal_key=str(self.kwargs.get("refinement_signal_key", "pred_spec")),
-                adapter_hidden_channels=int(self.kwargs.get("refinement_adapter_hidden_channels", 16)),
-                adapter_num_layers=int(self.kwargs.get("refinement_adapter_num_layers", 2)),
+                adapter_hidden_channels=int(self.kwargs.get("refinement_adapter_hidden_channels") or 16),
+                adapter_num_layers=int(self.kwargs.get("refinement_adapter_num_layers") or 2),
                 adapter_activation=str(self.kwargs.get("refinement_adapter_activation", "silu")),
                 residual_to_base_input=bool(self.kwargs.get("refinement_residual_to_base_input", True)),
                 return_history=bool(self.kwargs.get("refinement_return_history", False)),
@@ -492,32 +614,25 @@ class ssmodule_sep(pl.LightningModule):
             }
 
         guide_out = self.guide_encoder(mix_spec)
-        batch_size = mix_spec.shape[0]
-        class_index = self._resolve_batch_class_index(batch=batch, batch_size=batch_size, device=mix_spec.device)
+        batch_size = input_spec.shape[0]
+        class_index = self._extract_safe_guide_class_index(
+            batch=batch,
+            batch_size=batch_size,
+            device=input_spec.device,
+        )
 
-        time_condition = None
-        if bool(self.kwargs.get("use_time_film", False)):
-            strong_probabilities = guide_out["strong_probabilities"]
-            if class_index is None:
-                if strong_probabilities.shape[1] == 1:
-                    time_condition = strong_probabilities[:, :1, :]
-                else:
-                    raise ValueError(
-                        "use_time_film=True requires a target class index when guide_num_classes > 1."
-                    )
-            else:
-                time_condition = gather_class_probability_map(strong_probabilities, class_index)
+        time_condition = gather_class_probability_map(strong_probabilities, class_index)
 
-        hidden_states = None
-        if bool(self.kwargs.get("use_latent_injection", False)):
-            hidden_states = guide_out.get("hidden_states", None)
+                hidden_states = None
+                if bool(self.kwargs.get("use_latent_injection", False)):
+                    hidden_states = guide_out.get("hidden_states", None)
 
-        return {
-            "guide_out": guide_out,
-            "time_condition": time_condition,
-            "hidden_states": hidden_states,
-            "class_index": class_index,
-        }
+                return {
+                    "guide_out": guide_out,
+                    "time_condition": time_condition,
+                    "hidden_states": hidden_states,
+                    "class_index": class_index,
+                }
 
     def _run_separator(self, mix_wave: torch.Tensor, batch: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         mix_spec, mix_aux = self.frontend.wave_to_input_spec(mix_wave)

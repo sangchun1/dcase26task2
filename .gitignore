@@ -208,7 +208,7 @@ __marimo__/
 
 # Archive
 backup/
-dcase2025_task2_evaluator/teams_backup/
+dcase2025_task2_evaluator/
 # dcase2025_task2_evaluator/teams_result/
 # dcase2025_task2_evaluator/teams_additional_result/
 lightning_logs/
@@ -228,3 +228,4 @@ model/ssmodel/unilm/
 scripts/nohup/
 scripts/archive/
 custom.md
+checkpoints/
