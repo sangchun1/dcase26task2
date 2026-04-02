@@ -448,18 +448,57 @@ class ssmodule_sep(pl.LightningModule):
     def _maybe_load_pretrained_guide_encoder(self) -> None:
         if self.guide_encoder is None:
             return
+
         ckpt_path = self.kwargs.get("pretrained_guide_ckpt", None)
         if not ckpt_path:
+            print("[guide_pretrained] No pretrained guide checkpoint provided. Using random initialization.")
             return
 
-        ckpt = self._load_checkpoint_payload(ckpt_path)
-        state_dict = self._extract_state_dict_from_checkpoint(ckpt)
-        incompatible = self.guide_encoder.load_state_dict(state_dict, strict=bool(self.kwargs.get("pretrained_guide_strict", False)))
-        self.pretrained_load_info["guide_encoder"] = {
-            "checkpoint_path": str(ckpt_path),
-            "missing_keys": list(incompatible.missing_keys),
-            "unexpected_keys": list(incompatible.unexpected_keys),
-        }
+        checkpoint_path = Path(str(ckpt_path))
+        if not checkpoint_path.exists():
+            print(f"[guide_pretrained] Checkpoint not found: {checkpoint_path}. Using random initialization.")
+            return
+
+        try:
+            ckpt = self._load_checkpoint_payload(checkpoint_path)
+        except Exception as exc:
+            print(f"[guide_pretrained] Failed to load checkpoint: {checkpoint_path} ({exc}). Using random initialization.")
+            return
+
+        state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        if not isinstance(state_dict, dict):
+            print(f"[guide_pretrained] Invalid checkpoint format: {checkpoint_path}. Using random initialization.")
+            return
+
+        matched = {}
+        prefixes = [
+            "guide_encoder.",
+            "model.guide_encoder.",
+            "module.guide_encoder.",
+            "stage2_sed.",
+            "stage2_sed_guide.",
+            "module.stage2_sed.",
+            "sed_model.",
+            "tagger_model.",
+            "model.sed_model.",
+            "model.tagger_model.",
+            "embedding_injection.tagger_model.",
+        ]
+
+        for key, value in state_dict.items():
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    new_key = key[len(prefix):]
+                    matched[new_key] = value
+                    break
+
+        if len(matched) == 0:
+            print(f"[guide_pretrained] No matching keys found in {checkpoint_path}. Using random initialization.")
+            return
+
+        load_info = self.guide_encoder.load_state_dict(matched, strict=False)
+        print(f"[guide_pretrained] Loaded guide checkpoint from {checkpoint_path}")
+        print(load_info)
 
     # ------------------------------------------------------------------
     # Dataloaders
@@ -623,16 +662,16 @@ class ssmodule_sep(pl.LightningModule):
 
         time_condition = gather_class_probability_map(strong_probabilities, class_index)
 
-                hidden_states = None
-                if bool(self.kwargs.get("use_latent_injection", False)):
-                    hidden_states = guide_out.get("hidden_states", None)
+        hidden_states = None
+        if bool(self.kwargs.get("use_latent_injection", False)):
+            hidden_states = guide_out.get("hidden_states", None)
 
-                return {
-                    "guide_out": guide_out,
-                    "time_condition": time_condition,
-                    "hidden_states": hidden_states,
-                    "class_index": class_index,
-                }
+        return {
+            "guide_out": guide_out,
+            "time_condition": time_condition,
+            "hidden_states": hidden_states,
+            "class_index": class_index,
+        }
 
     def _run_separator(self, mix_wave: torch.Tensor, batch: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         mix_spec, mix_aux = self.frontend.wave_to_input_spec(mix_wave)

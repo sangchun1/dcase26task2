@@ -270,7 +270,7 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         help="External separator checkpoint path (e.g. AudioSep-style checkpoint)")
     parser.add_argument("--pretrained_sep_strict_backbone", default=False, action=argparse.BooleanOptionalAction,
                         help="Use strict loading for external separator backbone")
-    parser.add_argument("--pretrained_guide_ckpt", type=str, default="/home/user/PSC/ASD/2026/checkpoints/m2d_sed.ckpt",
+    parser.add_argument("--pretrained_guide_ckpt", type=str, default=None,
                         help="External stage2 guide / SED checkpoint path")
     parser.add_argument("--pretrained_guide_strict", default=False, action=argparse.BooleanOptionalAction,
                         help="Use strict loading for external guide encoder")
