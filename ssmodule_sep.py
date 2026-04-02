@@ -653,13 +653,17 @@ class ssmodule_sep(pl.LightningModule):
             }
 
         guide_out = self.guide_encoder(mix_spec)
-        batch_size = input_spec.shape[0]
+        strong_probabilities = guide_out["strong_probabilities"]
+
+        batch_size = mix_spec.shape[0]
+
         class_index = self._extract_safe_guide_class_index(
             batch=batch,
             batch_size=batch_size,
-            device=input_spec.device,
+            device=mix_spec.device,
         )
 
+        class_index = class_index.clamp(min=0, max=strong_probabilities.shape[1] - 1)
         time_condition = gather_class_probability_map(strong_probabilities, class_index)
 
         hidden_states = None

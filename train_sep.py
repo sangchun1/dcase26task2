@@ -351,7 +351,7 @@ def define_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     # Stage-2 guide / SED branch
     parser.add_argument("--use_stage2_sed", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--guide_input_channels", type=int, default=1)
-    parser.add_argument("--guide_num_classes", type=int, default=1)
+    parser.add_argument("--guide_num_classes", type=int, default=0)
     parser.add_argument("--guide_default_class_index", type=int, default=0)
     parser.add_argument("--guide_stem_channels", type=int, default=64)
     parser.add_argument("--guide_hidden_dim", type=int, default=256)

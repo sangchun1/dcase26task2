@@ -239,8 +239,6 @@ class SeparationDataset(Dataset):
         self.fixed_snr_db = fixed_snr_db
         self.return_realized_snr = return_realized_snr
         self.guide_class_mode = str(guide_class_mode)
-        self.guide_return_reference_wave = bool(guide_return_reference_wave)
-        self.guide_reference_strategy = str(guide_reference_strategy)
         self.guide_class_column = guide_class_column
         self.class_to_index = self._build_class_to_index(self.df)
         self.index_to_class = {v: k for k, v in self.class_to_index.items()}

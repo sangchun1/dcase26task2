@@ -4,13 +4,13 @@ GPU available: True (cuda), used: True
 TPU available: False, using: 0 TPU cores
 HPU available: False, using: 0 HPUs
 wandb: Currently logged in as: sangchun1 (sangchun1-chung-ang-university) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
-wandb: setting up run ps5oc67z
+wandb: setting up run a8tg0eg7
 wandb: Tracking run with wandb version 0.22.3
-wandb: Run data is saved locally in ./wandb/run-20260402_133759-ps5oc67z
+wandb: Run data is saved locally in ./wandb/run-20260402_142921-a8tg0eg7
 wandb: Run `wandb offline` to turn off syncing.
 wandb: Syncing run sep_resunet_audiosep
 wandb: ⭐️ View project at https://wandb.ai/sangchun1-chung-ang-university/2026_sep_train
-wandb: 🚀 View run at https://wandb.ai/sangchun1-chung-ang-university/2026_sep_train/runs/ps5oc67z
+wandb: 🚀 View run at https://wandb.ai/sangchun1-chung-ang-university/2026_sep_train/runs/a8tg0eg7
 wandb: Detected [huggingface_hub.inference] in use.
 wandb: Use W&B Weave for improved LLM call tracing. Install Weave with `pip install weave` then add `import weave` to the top of your script.
 wandb: For more information, check out the docs at: https://weave-docs.wandb.ai/
@@ -40,14 +40,14 @@ Traceback (most recent call last):
     optim_conf = call._call_lightning_module_hook(model.trainer, "configure_optimizers", pl_module=model)
   File "/home/user/PSC/miniconda3/envs/dcase2/lib/python3.10/site-packages/lightning/pytorch/trainer/call.py", line 171, in _call_lightning_module_hook
     output = fn(*args, **kwargs)
-  File "/home/user/PSC/ASD/2026/ssmodule_sep.py", line 1251, in configure_optimizers
+  File "/home/user/PSC/ASD/2026/ssmodule_sep.py", line 1255, in configure_optimizers
     num_samples = len(self.train_dataloader().dataset)
   File "/home/user/PSC/ASD/2026/ssmodule_sep.py", line 567, in train_dataloader
     return self._make_separation_dataloader(
   File "/home/user/PSC/ASD/2026/ssmodule_sep.py", line 514, in _make_separation_dataloader
     dataset = SeparationDataset(
-  File "/home/user/PSC/ASD/2026/model/data/separation_dataset.py", line 242, in __init__
-    self.guide_return_reference_wave = bool(guide_return_reference_wave)
-NameError: name 'guide_return_reference_wave' is not defined
+  File "/home/user/PSC/ASD/2026/model/data/separation_dataset.py", line 243, in __init__
+    self.class_to_index = self._build_class_to_index(self.df)
+AttributeError: 'SeparationDataset' object has no attribute 'df'
 [1;34mwandb[0m: 
 [1;34mwandb[0m: 🚀 View run [33msep_resunet_audiosep[0m at: [34m[0m
