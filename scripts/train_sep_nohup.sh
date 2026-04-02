@@ -72,9 +72,6 @@ ENABLE_LOGGING="${ENABLE_LOGGING:-true}"
 # -----------------------------------------------------------------------------
 PRETRAINED_SEP_CKPT=${PRETRAINED_SEP_CKPT:-/home/user/PSC/ASD/2026/checkpoints/audiosep_sed.ckpt}
 PRETRAINED_SEP_STRICT_BACKBONE="${PRETRAINED_SEP_STRICT_BACKBONE:-false}"
-if [[ -n "${PRETRAINED_GUIDE_CKPT:-}" ]]; then
-  CMD+=(--pretrained_guide_ckpt "${PRETRAINED_GUIDE_CKPT}")
-fi
 PRETRAINED_GUIDE_STRICT="${PRETRAINED_GUIDE_STRICT:-false}"
 LOAD_EXTERNAL_PRETRAINED_IN_DRIVER="${LOAD_EXTERNAL_PRETRAINED_IN_DRIVER:-true}"
 
@@ -218,9 +215,9 @@ fi
 if [[ "${PRETRAINED_SEP_STRICT_BACKBONE}" == "true" ]]; then
   CMD+=(--pretrained_sep_strict_backbone)
 fi
-# if [[ -n "${PRETRAINED_GUIDE_CKPT}" ]]; then
-#   CMD+=(--pretrained_guide_ckpt "${PRETRAINED_GUIDE_CKPT}")
-# fi
+if [[ -n "${PRETRAINED_GUIDE_CKPT:-}" ]]; then
+  CMD+=(--pretrained_guide_ckpt "${PRETRAINED_GUIDE_CKPT}")
+fi
 if [[ "${PRETRAINED_GUIDE_STRICT}" == "true" ]]; then
   CMD+=(--pretrained_guide_strict)
 fi

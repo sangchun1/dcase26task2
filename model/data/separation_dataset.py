@@ -240,9 +240,6 @@ class SeparationDataset(Dataset):
         self.return_realized_snr = return_realized_snr
         self.guide_class_mode = str(guide_class_mode)
         self.guide_class_column = guide_class_column
-        self.class_to_index = self._build_class_to_index(self.df)
-        self.index_to_class = {v: k for k, v in self.class_to_index.items()}
-        self.num_classes = len(self.class_to_index)
         self.return_reference_wave = bool(return_reference_wave)
         self.reference_mode = str(reference_mode)
         self.reference_exclude_self = bool(reference_exclude_self)
@@ -271,6 +268,10 @@ class SeparationDataset(Dataset):
         self.df["guide_class_name"] = self.df["guide_class_name"].astype(str)
         self.df["guide_class_index"] = self.df["guide_class_name"].map(self.guide_class_to_index).astype(int)
 
+        self.class_to_index = self._build_class_to_index(self.df)
+        self.index_to_class = {v: k for k, v in self.class_to_index.items()}
+        self.num_classes = len(self.class_to_index)
+        
         self.target_rows: List[SeparationRow] = [self._row_to_obj(row) for _, row in self.df.iterrows()]
         self.rows_by_machine: Dict[str, List[int]] = self._build_rows_by_machine(self.df)
         self.rows_by_guide_class: Dict[str, List[int]] = self._build_rows_by_column(self.df, "guide_class_name")
