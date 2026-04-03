@@ -45,6 +45,10 @@ class FeatureHeadConfig:
         - ``"max"``: global max pooling over ``F,T``
         - ``"mean_max"``: concatenate global mean and global max
         - ``"mean_std"``: concatenate global mean and standard deviation
+        - ``"temporal_mean"``: mean over time after frequency aggregation
+        - ``"temporal_max"``: max over time after frequency aggregation
+        - ``"temporal_mean_max"``: concatenate temporal mean and temporal max
+        - ``"temporal_mean_std"``: concatenate temporal mean and temporal standard deviation
     projection_dim:
         Optional per-level projection dimension. If provided, every pooled level
         vector is passed through its own ``LazyLinear(projection_dim)`` before
@@ -78,7 +82,16 @@ class FeatureHeadConfig:
 
 def _validate_pooling(pooling: str) -> str:
     pooling = pooling.lower()
-    supported = {"mean", "max", "mean_max", "mean_std"}
+    supported = {
+        "mean",
+        "max",
+        "mean_max",
+        "mean_std",
+        "temporal_mean",
+        "temporal_max",
+        "temporal_mean_max",
+        "temporal_mean_std",
+    }
     if pooling not in supported:
         raise ValueError(f"Unsupported pooling={pooling!r}. Supported: {sorted(supported)}")
     return pooling
@@ -140,6 +153,12 @@ def pool_feature_map(feature_map: torch.Tensor, pooling: str = "mean") -> torch.
         Input tensor with shape ``[B,C,F,T]``.
     pooling:
         Pooling mode; see :class:`FeatureHeadConfig`.
+
+    Notes
+    -----
+    ``temporal_*`` pooling modes first aggregate the frequency axis with a mean
+    reduction to obtain a sequence ``[B,C,T]``, then apply the requested
+    temporal pooling over ``T``.
     """
     pooling = _validate_pooling(pooling)
     if feature_map.ndim != 4:
@@ -158,6 +177,21 @@ def pool_feature_map(feature_map: torch.Tensor, pooling: str = "mean") -> torch.
         flat = feature_map.flatten(start_dim=2)
         std_vec = flat.std(dim=2, unbiased=False)
         return torch.cat([mean_vec, std_vec], dim=1)
+
+    temporal_seq = feature_map.mean(dim=2)  # [B,C,T]
+
+    if pooling == "temporal_mean":
+        return temporal_seq.mean(dim=2)
+    if pooling == "temporal_max":
+        return temporal_seq.amax(dim=2)
+    if pooling == "temporal_mean_max":
+        temporal_mean = temporal_seq.mean(dim=2)
+        temporal_max = temporal_seq.amax(dim=2)
+        return torch.cat([temporal_mean, temporal_max], dim=1)
+    if pooling == "temporal_mean_std":
+        temporal_mean = temporal_seq.mean(dim=2)
+        temporal_std = temporal_seq.std(dim=2, unbiased=False)
+        return torch.cat([temporal_mean, temporal_std], dim=1)
 
     raise RuntimeError(f"Unexpected pooling mode: {pooling!r}")
 

@@ -26,6 +26,7 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
+from sklearn.metrics import roc_auc_score
 
 import lightning.pytorch as pl
 
@@ -110,9 +111,14 @@ class ssmodule_sep(pl.LightningModule):
         self.best_final_score = float("-inf")
 
         self.md_best_state: Dict[str, Any] = {
+            "scorer": str(self._get_runtime_option("asd_scorer", "ASD_SCORER", "md")).lower(),
             "regularization": float(self.kwargs.get("md_regularization", 1e-5)),
             "covariance_type": str(self.kwargs.get("md_covariance_type", "full")),
             "domain_strategy": str(self.kwargs.get("md_domain_strategy", "source_target_min")),
+            "knn_k": int(self._get_runtime_option("knn_k", "KNN_K", 1)),
+            "knn_dist": str(self._get_runtime_option("knn_dist", "KNN_DIST", "cosine")).lower(),
+            "ldn_ks": int(self._get_runtime_option("ldn_ks", "LDN_KS", 16)),
+            "ldn_kt": int(self._get_runtime_option("ldn_kt", "LDN_KT", 9)),
         }
 
         devices = str(self.kwargs.get("devices", "0"))
@@ -761,6 +767,341 @@ class ssmodule_sep(pl.LightningModule):
         return self._build_feature_bank_from_loader(loader, name="train_feature_bank")
 
     # ------------------------------------------------------------------
+    # ASD scorer helpers
+    # ------------------------------------------------------------------
+    def _get_runtime_option(self, key: str, env_key: str, default):
+        value = self.kwargs.get(key, None)
+        if value is None or value == "":
+            env_value = os.getenv(env_key, None)
+            if env_value is None or env_value == "":
+                return default
+            return env_value
+        return value
+
+    def _get_asd_scorer_config(self) -> Dict[str, Any]:
+        scorer = str(self._get_runtime_option("asd_scorer", "ASD_SCORER", "md")).lower()
+        knn_k = int(self._get_runtime_option("knn_k", "KNN_K", 1))
+        knn_dist = str(self._get_runtime_option("knn_dist", "KNN_DIST", "cosine")).lower()
+        ldn_ks = int(self._get_runtime_option("ldn_ks", "LDN_KS", 16))
+        ldn_kt = int(self._get_runtime_option("ldn_kt", "LDN_KT", 9))
+        if scorer not in {"md", "knn", "ldn"}:
+            raise ValueError(f"Unsupported ASD scorer: {scorer!r}. Use one of ['md', 'knn', 'ldn'].")
+        if knn_dist not in {"cosine", "l2"}:
+            raise ValueError(f"Unsupported knn_dist={knn_dist!r}. Use 'cosine' or 'l2'.")
+        return {
+            "scorer": scorer,
+            "knn_k": max(int(knn_k), 1),
+            "knn_dist": knn_dist,
+            "ldn_ks": max(int(ldn_ks), 1),
+            "ldn_kt": max(int(ldn_kt), 1),
+        }
+
+    @staticmethod
+    def _harmonic_mean_safe(values: Sequence[float], eps: float = 1e-12) -> float:
+        arr = np.asarray(values, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return 0.0
+        arr = np.clip(arr, eps, None)
+        return float(arr.size / np.sum(1.0 / arr))
+
+    @staticmethod
+    def _pairwise_distance(a: np.ndarray, b: np.ndarray, dist: str = "cosine") -> np.ndarray:
+        a = np.asarray(a, dtype=np.float32)
+        b = np.asarray(b, dtype=np.float32)
+        if a.ndim != 2 or b.ndim != 2:
+            raise ValueError(f"Expected 2D arrays, got a={a.shape}, b={b.shape}")
+        if dist == "cosine":
+            a_norm = np.linalg.norm(a, axis=1, keepdims=True)
+            b_norm = np.linalg.norm(b, axis=1, keepdims=True)
+            a_norm = np.clip(a_norm, 1e-12, None)
+            b_norm = np.clip(b_norm, 1e-12, None)
+            sim = (a / a_norm) @ (b / b_norm).T
+            return (1.0 - sim).astype(np.float32)
+        if dist == "l2":
+            a_sq = np.sum(a * a, axis=1, keepdims=True)
+            b_sq = np.sum(b * b, axis=1, keepdims=True).T
+            d2 = np.maximum(a_sq + b_sq - 2.0 * (a @ b.T), 0.0)
+            return np.sqrt(d2, dtype=np.float32)
+        raise ValueError(f"Unsupported distance metric: {dist!r}")
+
+    @staticmethod
+    def _safe_topk_mean(distances: np.ndarray, k: int) -> float:
+        distances = np.asarray(distances, dtype=np.float32).reshape(-1)
+        if distances.size == 0:
+            return float("inf")
+        k_eff = max(1, min(int(k), distances.size))
+        nearest = np.partition(distances, k_eff - 1)[:k_eff]
+        return float(np.mean(nearest))
+
+    @staticmethod
+    def _safe_knn_sum(self_dist: np.ndarray, k: int, eps: float = 1e-8) -> np.ndarray:
+        self_dist = np.asarray(self_dist, dtype=np.float32)
+        if self_dist.shape[0] == 0:
+            return np.array([], dtype=np.float32)
+        sorted_dist = np.sort(self_dist, axis=1)[:, 1:]
+        k_eff = max(1, min(int(k), sorted_dist.shape[1] if sorted_dist.shape[1] > 0 else 1))
+        if sorted_dist.shape[1] == 0:
+            return np.full((self_dist.shape[0],), eps, dtype=np.float32)
+        return (np.sum(sorted_dist[:, :k_eff], axis=1) + eps).astype(np.float32)
+
+    def _compute_knn_split_scores(
+        self,
+        train_embeddings: np.ndarray,
+        test_embeddings: np.ndarray,
+        train_metadata: pd.DataFrame,
+        test_metadata: pd.DataFrame,
+        *,
+        k: int,
+        dist: str,
+    ) -> np.ndarray:
+        train_df = train_metadata.reset_index(drop=True).copy()
+        test_df = test_metadata.reset_index(drop=True).copy()
+        train_df["machine"] = train_df["machine"].astype(str)
+        test_df["machine"] = test_df["machine"].astype(str)
+        if "domain" in train_df.columns:
+            train_df["domain"] = train_df["domain"].astype(str).str.lower()
+
+        source_refs: Dict[str, np.ndarray] = {}
+        target_refs: Dict[str, np.ndarray] = {}
+        machine_refs: Dict[str, np.ndarray] = {}
+
+        for machine in train_df["machine"].unique():
+            machine_mask = train_df["machine"] == machine
+            machine_emb = np.asarray(train_embeddings[machine_mask.to_numpy()], dtype=np.float32)
+            machine_refs[machine] = machine_emb
+
+            if "domain" in train_df.columns:
+                src_idx = train_df[machine_mask & (train_df["domain"] == "source")].index.to_numpy()
+                tgt_idx = train_df[machine_mask & (train_df["domain"] == "target")].index.to_numpy()
+                source_refs[machine] = np.asarray(train_embeddings[src_idx], dtype=np.float32)
+                target_refs[machine] = np.asarray(train_embeddings[tgt_idx], dtype=np.float32)
+            else:
+                source_refs[machine] = machine_emb
+                target_refs[machine] = machine_emb
+
+        test_scores = np.zeros((len(test_df),), dtype=np.float32)
+        for i in range(len(test_df)):
+            machine = str(test_df.loc[i, "machine"])
+            y = np.asarray(test_embeddings[i : i + 1], dtype=np.float32)
+
+            Fs = source_refs.get(machine, np.zeros((0, y.shape[1]), dtype=np.float32))
+            Ft = target_refs.get(machine, np.zeros((0, y.shape[1]), dtype=np.float32))
+            Fm = machine_refs.get(machine, np.zeros((0, y.shape[1]), dtype=np.float32))
+
+            if Fs.shape[0] == 0 and Ft.shape[0] == 0:
+                refs = Fm
+                d_all = self._pairwise_distance(y, refs, dist=dist).reshape(-1) if refs.shape[0] > 0 else np.array([], dtype=np.float32)
+                test_scores[i] = self._safe_topk_mean(d_all, k=k)
+                continue
+
+            s_s = self._safe_topk_mean(self._pairwise_distance(y, Fs, dist=dist).reshape(-1), k=k) if Fs.shape[0] > 0 else float("inf")
+            s_t = self._safe_topk_mean(self._pairwise_distance(y, Ft, dist=dist).reshape(-1), k=k) if Ft.shape[0] > 0 else float("inf")
+            test_scores[i] = float(min(s_s, s_t))
+        return test_scores
+
+    def _compute_ldn_split_scores(
+        self,
+        train_embeddings: np.ndarray,
+        test_embeddings: np.ndarray,
+        train_metadata: pd.DataFrame,
+        test_metadata: pd.DataFrame,
+        *,
+        ks: int,
+        kt: int,
+        dist: str,
+    ) -> np.ndarray:
+        train_df = train_metadata.reset_index(drop=True).copy()
+        test_df = test_metadata.reset_index(drop=True).copy()
+        train_df["machine"] = train_df["machine"].astype(str)
+        test_df["machine"] = test_df["machine"].astype(str)
+        if "domain" in train_df.columns:
+            train_df["domain"] = train_df["domain"].astype(str).str.lower()
+
+        source_refs: Dict[str, np.ndarray] = {}
+        target_refs: Dict[str, np.ndarray] = {}
+        source_denoms: Dict[str, np.ndarray] = {}
+        target_denoms: Dict[str, np.ndarray] = {}
+
+        for machine in train_df["machine"].unique():
+            machine_mask = train_df["machine"] == machine
+
+            if "domain" in train_df.columns:
+                src_idx = train_df[machine_mask & (train_df["domain"] == "source")].index.to_numpy()
+                tgt_idx = train_df[machine_mask & (train_df["domain"] == "target")].index.to_numpy()
+            else:
+                idx = train_df[machine_mask].index.to_numpy()
+                src_idx = idx
+                tgt_idx = idx
+
+            Fs = np.asarray(train_embeddings[src_idx], dtype=np.float32)
+            Ft = np.asarray(train_embeddings[tgt_idx], dtype=np.float32)
+
+            source_refs[machine] = Fs
+            target_refs[machine] = Ft
+
+            src_self_dist = self._pairwise_distance(Fs, Fs, dist=dist) if Fs.shape[0] > 0 else np.zeros((0, 0), dtype=np.float32)
+            tgt_self_dist = self._pairwise_distance(Ft, Ft, dist=dist) if Ft.shape[0] > 0 else np.zeros((0, 0), dtype=np.float32)
+
+            source_denoms[machine] = self._safe_knn_sum(src_self_dist, ks)
+            target_denoms[machine] = self._safe_knn_sum(tgt_self_dist, kt)
+
+        test_scores = np.zeros((len(test_df),), dtype=np.float32)
+        for i in range(len(test_df)):
+            machine = str(test_df.loc[i, "machine"])
+            y = np.asarray(test_embeddings[i : i + 1], dtype=np.float32)
+
+            Fs = source_refs.get(machine, np.zeros((0, y.shape[1]), dtype=np.float32))
+            Ft = target_refs.get(machine, np.zeros((0, y.shape[1]), dtype=np.float32))
+
+            if Fs.shape[0] == 0:
+                s_s = float("inf")
+            else:
+                d_src = self._pairwise_distance(y, Fs, dist=dist).reshape(-1)
+                s_s = float(np.min(d_src / source_denoms[machine]))
+
+            if Ft.shape[0] == 0:
+                s_t = float("inf")
+            else:
+                d_tgt = self._pairwise_distance(y, Ft, dist=dist).reshape(-1)
+                s_t = float(np.min(d_tgt / target_denoms[machine]))
+
+            test_scores[i] = float(min(s_s, s_t))
+        return test_scores
+
+    @staticmethod
+    def _safe_auc(y_true: np.ndarray, y_score: np.ndarray, max_fpr: Optional[float] = None) -> float:
+        y_true = np.asarray(y_true).reshape(-1)
+        y_score = np.asarray(y_score).reshape(-1)
+        if y_true.size == 0 or np.unique(y_true).size < 2:
+            return float("nan")
+        try:
+            if max_fpr is None:
+                return float(roc_auc_score(y_true, y_score))
+            return float(roc_auc_score(y_true, y_score, max_fpr=max_fpr))
+        except Exception:
+            return float("nan")
+
+    def _evaluate_anomaly_scores(
+        self,
+        metadata: pd.DataFrame,
+        anomaly_scores: np.ndarray,
+        *,
+        max_fpr: float,
+    ) -> Tuple[Dict[str, List[float]], float, float, float, float]:
+        df = metadata.reset_index(drop=True).copy()
+        df["machine"] = df["machine"].astype(str)
+        if "domain" in df.columns:
+            df["domain"] = df["domain"].astype(str).str.lower()
+        df["label"] = self._labels_to_binary(df["label"])
+        df["anomaly_score"] = np.asarray(anomaly_scores, dtype=np.float32)
+
+        p_aucs: List[float] = []
+        aucs_source: List[float] = []
+        aucs_target: List[float] = []
+        machine_results: Dict[str, List[float]] = {}
+
+        for machine in df["machine"].unique():
+            temp = df[df["machine"] == machine]
+            p_auc = self._safe_auc(temp["label"].to_numpy(), temp["anomaly_score"].to_numpy(), max_fpr=max_fpr)
+
+            if "domain" in temp.columns:
+                temp_source = temp[temp["domain"] == "source"]
+                temp_target = temp[temp["domain"] == "target"]
+            else:
+                temp_source = temp
+                temp_target = temp
+
+            auc_source = self._safe_auc(temp_source["label"].to_numpy(), temp_source["anomaly_score"].to_numpy(), max_fpr=None)
+            auc_target = self._safe_auc(temp_target["label"].to_numpy(), temp_target["anomaly_score"].to_numpy(), max_fpr=None)
+
+            p_aucs.append(p_auc)
+            aucs_source.append(auc_source)
+            aucs_target.append(auc_target)
+            machine_results[machine] = [p_auc, auc_source, auc_target]
+
+        mean_auc_source = float(np.nanmean(aucs_source)) if len(aucs_source) > 0 else 0.0
+        mean_auc_target = float(np.nanmean(aucs_target)) if len(aucs_target) > 0 else 0.0
+        mean_p_auc = float(np.nanmean(p_aucs)) if len(p_aucs) > 0 else 0.0
+        final_score = self._harmonic_mean_safe([mean_auc_source, mean_auc_target, mean_p_auc])
+
+        return machine_results, mean_auc_source, mean_auc_target, mean_p_auc, final_score
+
+    def _compute_asd_scores(
+        self,
+        train_bank: FeatureBank,
+        test_bank: FeatureBank,
+        *,
+        score_test_only: bool,
+        max_fpr: Optional[float] = None,
+        state_override: Optional[Mapping[str, Any]] = None,
+    ):
+        state = dict(self._get_asd_scorer_config())
+        if state_override:
+            state.update({k: v for k, v in dict(state_override).items() if v is not None})
+
+        scorer = str(state.get("scorer", "md")).lower()
+        if scorer == "md":
+            if score_test_only:
+                scores = compute_result_md(
+                    result_train=train_bank.embeddings,
+                    result_test=test_bank.embeddings,
+                    regularization=float(state.get("regularization", self.kwargs.get("md_regularization", 1e-5))),
+                    covariance_type=str(state.get("covariance_type", self.kwargs.get("md_covariance_type", "full"))),
+                    domain_strategy=str(state.get("domain_strategy", self.kwargs.get("md_domain_strategy", "source_target_min"))),
+                    train_metadata=train_bank.metadata,
+                    test_metadata=test_bank.metadata,
+                    test=True,
+                )
+                return np.asarray(scores, dtype=np.float32)
+            machine_results, mean_auc_source, mean_auc_target, mean_p_auc, final_score = compute_result_md(
+                result_train=train_bank.embeddings,
+                result_test=test_bank.embeddings,
+                regularization=float(state.get("regularization", self.kwargs.get("md_regularization", 1e-5))),
+                covariance_type=str(state.get("covariance_type", self.kwargs.get("md_covariance_type", "full"))),
+                domain_strategy=str(state.get("domain_strategy", self.kwargs.get("md_domain_strategy", "source_target_min"))),
+                train_metadata=train_bank.metadata,
+                test_metadata=test_bank.metadata,
+                test=False,
+                max_fpr=float(max_fpr if max_fpr is not None else self.kwargs.get("max_fpr", 0.1)),
+            )
+            return machine_results, float(mean_auc_source), float(mean_auc_target), float(mean_p_auc), float(final_score)
+
+        train_emb = np.asarray(train_bank.embeddings, dtype=np.float32)
+        test_emb = np.asarray(test_bank.embeddings, dtype=np.float32)
+
+        if scorer == "knn":
+            scores = self._compute_knn_split_scores(
+                train_embeddings=train_emb,
+                test_embeddings=test_emb,
+                train_metadata=train_bank.metadata,
+                test_metadata=test_bank.metadata,
+                k=int(state.get("knn_k", 1)),
+                dist=str(state.get("knn_dist", "cosine")),
+            )
+        elif scorer == "ldn":
+            scores = self._compute_ldn_split_scores(
+                train_embeddings=train_emb,
+                test_embeddings=test_emb,
+                train_metadata=train_bank.metadata,
+                test_metadata=test_bank.metadata,
+                ks=int(state.get("ldn_ks", 16)),
+                kt=int(state.get("ldn_kt", 9)),
+                dist=str(state.get("knn_dist", "cosine")),
+            )
+        else:
+            raise RuntimeError(f"Unexpected scorer: {scorer!r}")
+
+        if score_test_only:
+            return scores.astype(np.float32)
+
+        return self._evaluate_anomaly_scores(
+            metadata=test_bank.metadata,
+            anomaly_scores=scores,
+            max_fpr=float(max_fpr if max_fpr is not None else self.kwargs.get("max_fpr", 0.1)),
+        )
+
+    # ------------------------------------------------------------------
     # Distributed helpers
     # ------------------------------------------------------------------
     def _gather_feature_bank(self, bank: FeatureBank) -> FeatureBank:
@@ -871,10 +1212,22 @@ class ssmodule_sep(pl.LightningModule):
         val_bank = self._gather_feature_bank(val_bank_local)
         train_bank = self._train_feature_bank()
 
+        scorer_cfg = self._get_asd_scorer_config()
         regularization = float(self.kwargs.get("md_regularization", 1e-5))
         covariance_type = str(self.kwargs.get("md_covariance_type", "full"))
         domain_strategy = str(self.kwargs.get("md_domain_strategy", "source_target_min"))
         max_fpr = float(self.kwargs.get("max_fpr", 0.1))
+
+        scorer_state = {
+            "scorer": scorer_cfg["scorer"],
+            "regularization": regularization,
+            "covariance_type": covariance_type,
+            "domain_strategy": domain_strategy,
+            "knn_k": int(scorer_cfg["knn_k"]),
+            "knn_dist": str(scorer_cfg["knn_dist"]),
+            "ldn_ks": int(scorer_cfg["ldn_ks"]),
+            "ldn_kt": int(scorer_cfg["ldn_kt"]),
+        }
 
         (
             machine_results,
@@ -882,27 +1235,19 @@ class ssmodule_sep(pl.LightningModule):
             mean_auc_target,
             mean_p_auc,
             final_score,
-        ) = compute_result_md(
-            result_train=train_bank.embeddings,
-            result_test=val_bank.embeddings,
-            regularization=regularization,
-            covariance_type=covariance_type,
-            domain_strategy=domain_strategy,
-            train_metadata=train_bank.metadata,
-            test_metadata=val_bank.metadata,
-            test=False,
+        ) = self._compute_asd_scores(
+            train_bank=train_bank,
+            test_bank=val_bank,
+            score_test_only=False,
             max_fpr=max_fpr,
+            state_override=scorer_state,
         )
 
-        val_scores = compute_result_md(
-            result_train=train_bank.embeddings,
-            result_test=val_bank.embeddings,
-            regularization=regularization,
-            covariance_type=covariance_type,
-            domain_strategy=domain_strategy,
-            train_metadata=train_bank.metadata,
-            test_metadata=val_bank.metadata,
-            test=True,
+        val_scores = self._compute_asd_scores(
+            train_bank=train_bank,
+            test_bank=val_bank,
+            score_test_only=True,
+            state_override=scorer_state,
         )
         decision_thresholds = self._compute_labeled_thresholds(
             metadata=val_bank.metadata,
@@ -916,9 +1261,7 @@ class ssmodule_sep(pl.LightningModule):
 
         if self.trainer.is_global_zero:
             self.md_best_state = {
-                "regularization": regularization,
-                "covariance_type": covariance_type,
-                "domain_strategy": domain_strategy,
+                **scorer_state,
                 "machine_results": machine_results,
                 "decision_thresholds": decision_thresholds,
             }
@@ -942,32 +1285,31 @@ class ssmodule_sep(pl.LightningModule):
         test_bank = self._gather_feature_bank(test_bank_local)
         train_bank = self._train_feature_bank()
 
-        regularization = float(self.md_best_state.get("regularization", self.kwargs.get("md_regularization", 1e-5)))
-        covariance_type = str(self.md_best_state.get("covariance_type", self.kwargs.get("md_covariance_type", "full")))
-        domain_strategy = str(self.md_best_state.get("domain_strategy", self.kwargs.get("md_domain_strategy", "source_target_min")))
+        scorer_state = {
+            "scorer": str(self.md_best_state.get("scorer", self._get_asd_scorer_config()["scorer"])).lower(),
+            "regularization": float(self.md_best_state.get("regularization", self.kwargs.get("md_regularization", 1e-5))),
+            "covariance_type": str(self.md_best_state.get("covariance_type", self.kwargs.get("md_covariance_type", "full"))),
+            "domain_strategy": str(self.md_best_state.get("domain_strategy", self.kwargs.get("md_domain_strategy", "source_target_min"))),
+            "knn_k": int(self.md_best_state.get("knn_k", self._get_asd_scorer_config()["knn_k"])),
+            "knn_dist": str(self.md_best_state.get("knn_dist", self._get_asd_scorer_config()["knn_dist"])).lower(),
+            "ldn_ks": int(self.md_best_state.get("ldn_ks", self._get_asd_scorer_config()["ldn_ks"])),
+            "ldn_kt": int(self.md_best_state.get("ldn_kt", self._get_asd_scorer_config()["ldn_kt"])),
+        }
 
-        anomaly_scores = compute_result_md(
-            result_train=train_bank.embeddings,
-            result_test=test_bank.embeddings,
-            regularization=regularization,
-            covariance_type=covariance_type,
-            domain_strategy=domain_strategy,
-            train_metadata=train_bank.metadata,
-            test_metadata=test_bank.metadata,
-            test=True,
+        anomaly_scores = self._compute_asd_scores(
+            train_bank=train_bank,
+            test_bank=test_bank,
+            score_test_only=True,
+            state_override=scorer_state,
         )
 
         decision_thresholds = self.md_best_state.get("decision_thresholds", None)
         if not decision_thresholds:
-            train_scores = compute_result_md(
-                result_train=train_bank.embeddings,
-                result_test=train_bank.embeddings,
-                regularization=regularization,
-                covariance_type=covariance_type,
-                domain_strategy=domain_strategy,
-                train_metadata=train_bank.metadata,
-                test_metadata=train_bank.metadata,
-                test=True,
+            train_scores = self._compute_asd_scores(
+                train_bank=train_bank,
+                test_bank=train_bank,
+                score_test_only=True,
+                state_override=scorer_state,
             )
             decision_thresholds = self._compute_percentile_thresholds(
                 metadata=train_bank.metadata,
