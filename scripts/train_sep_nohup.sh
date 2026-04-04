@@ -70,8 +70,9 @@ ENABLE_LOGGING="${ENABLE_LOGGING:-true}"
 # -----------------------------------------------------------------------------
 # External pretrained initialization (actual transfer learning)
 # -----------------------------------------------------------------------------
-PRETRAINED_SEP_CKPT=${PRETRAINED_SEP_CKPT:-/home/user/PSC/ASD/2026/checkpoints/audiosep_sed.ckpt}
+PRETRAINED_SEP_CKPT="${PRETRAINED_SEP_CKPT-/home/user/PSC/ASD/2026/checkpoints/audiosep_sed.ckpt}"
 PRETRAINED_SEP_STRICT_BACKBONE="${PRETRAINED_SEP_STRICT_BACKBONE:-false}"
+PRETRAINED_GUIDE_CKPT="${PRETRAINED_GUIDE_CKPT-}"
 PRETRAINED_GUIDE_STRICT="${PRETRAINED_GUIDE_STRICT:-false}"
 LOAD_EXTERNAL_PRETRAINED_IN_DRIVER="${LOAD_EXTERNAL_PRETRAINED_IN_DRIVER:-true}"
 
