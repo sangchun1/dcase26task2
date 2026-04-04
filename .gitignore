@@ -229,3 +229,6 @@ scripts/nohup/
 scripts/archive/
 custom.md
 checkpoints/
+
+probe_ckpt_compat.py
+probe_ckpt_files.py

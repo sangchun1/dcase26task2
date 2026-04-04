@@ -499,6 +499,56 @@ class ResUNetSeparator(nn.Module):
             }
         return output
 
+    @staticmethod
+    def _adapt_input_channel_weight(
+        source: torch.Tensor,
+        target_shape: torch.Size,
+    ) -> Optional[torch.Tensor]:
+        """Adapt an external conv-like weight to a smaller input-channel count.
+
+        This is mainly for importing Morocutti/AudiosSep-style separator weights
+        trained on 4-channel mixtures (or 5 channels for iterative refinement)
+        into this mono ASD separator. When only the input-channel dimension is
+        different, the source channels are reduced by averaging.
+
+        Special case:
+            source_in=5 and target_in=1 -> average only the first 4 channels,
+            so iterative checkpoints do not mix the extra refinement estimate
+            channel into the mono front-end initialization.
+        """
+
+        if source.ndim < 3 or len(target_shape) != source.ndim:
+            return None
+        if target_shape[1] >= source.shape[1]:
+            return None
+        if tuple(source.shape[0:1]) != tuple(target_shape[0:1]):
+            return None
+        if tuple(source.shape[2:]) != tuple(target_shape[2:]):
+            return None
+
+        target_in = int(target_shape[1])
+        source_in = int(source.shape[1])
+        if target_in <= 0 or source_in <= 0:
+            return None
+
+        reduce_source = source
+        if source_in == 5 and target_in == 1:
+            reduce_source = source[:, :4, ...]
+            source_in = 4
+
+        if target_in == source_in:
+            return reduce_source
+
+        if target_in == 1:
+            return reduce_source.mean(dim=1, keepdim=True)
+
+        if source_in % target_in != 0:
+            return None
+
+        group_size = source_in // target_in
+        new_shape = (reduce_source.shape[0], target_in, group_size, *reduce_source.shape[2:])
+        return reduce_source.reshape(new_shape).mean(dim=2)
+
     def load_pretrained_separator_state_dict(
         self,
         state_dict: Mapping[str, torch.Tensor],
@@ -515,7 +565,14 @@ class ResUNetSeparator(nn.Module):
 
         This helper is intended for later AudioSep-style initialization. It
         filters a foreign state dict down to keys that exist in the current
-        separator **and** match the expected tensor shape.
+        separator and either:
+
+        1. match the expected tensor shape exactly, or
+        2. can be adapted by reducing only the input-channel dimension.
+
+        The second path is important for transferring Morocutti-style separator
+        checkpoints trained with 4 input channels into this mono ASD backbone,
+        while still keeping the no-pretrained baseline completely unchanged.
 
         Parameters
         ----------
@@ -538,6 +595,7 @@ class ResUNetSeparator(nn.Module):
         normalized_state: Dict[str, torch.Tensor] = {}
         unexpected_source_keys: List[str] = []
         skipped_shape_keys: List[str] = []
+        adapted_shape_keys: List[str] = []
 
         for raw_key, value in state_dict.items():
             if not torch.is_tensor(value):
@@ -558,20 +616,29 @@ class ResUNetSeparator(nn.Module):
                 unexpected_source_keys.append(raw_key)
                 continue
 
-            if tuple(value.shape) != tuple(own_state[matched_key].shape):
-                skipped_shape_keys.append(raw_key)
+            target_tensor = own_state[matched_key]
+            if tuple(value.shape) == tuple(target_tensor.shape):
+                normalized_state[matched_key] = value
                 continue
 
-            normalized_state[matched_key] = value
+            adapted_value = self._adapt_input_channel_weight(value, target_tensor.shape)
+            if adapted_value is not None and tuple(adapted_value.shape) == tuple(target_tensor.shape):
+                normalized_state[matched_key] = adapted_value.to(dtype=target_tensor.dtype)
+                adapted_shape_keys.append(raw_key)
+                continue
+
+            skipped_shape_keys.append(raw_key)
 
         incompatible = self.load_state_dict(normalized_state, strict=strict_backbone)
         return {
             "num_loaded_tensors": len(normalized_state),
+            "num_adapted_tensors": len(adapted_shape_keys),
             "loaded_keys": sorted(normalized_state.keys()),
             "missing_keys": list(incompatible.missing_keys),
             "unexpected_keys": list(incompatible.unexpected_keys),
             "unexpected_source_keys": unexpected_source_keys,
             "skipped_shape_keys": skipped_shape_keys,
+            "adapted_shape_keys": adapted_shape_keys,
         }
 
 

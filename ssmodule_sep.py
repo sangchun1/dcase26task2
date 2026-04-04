@@ -80,6 +80,17 @@ class ssmodule_sep(pl.LightningModule):
     - refinement_detach_between_iterations
     """
 
+    def _should_use_module_pretrained_loader(self) -> bool:
+        """Return True when this module should preload external checkpoints.
+
+        The training driver can optionally own external checkpoint loading.
+        When that path is enabled, skip the in-module preload here so the same
+        separator / guide state dict is not partially loaded twice.
+        Baseline runs with pretrained disabled keep the same forward path.
+        """
+
+        return not bool(self.kwargs.get("load_external_pretrained_in_driver", False))
+
     def __init__(self, **kwargs) -> None:
         super().__init__()
         self.kwargs = dict(kwargs)
@@ -96,9 +107,14 @@ class ssmodule_sep(pl.LightningModule):
         self.metric_cfg = self._build_metric_config()
         self.metric_tracker = SeparationMetricTracker()
 
-        self.pretrained_load_info: Dict[str, Any] = {}
-        self._maybe_load_pretrained_separator()
-        self._maybe_load_pretrained_guide_encoder()
+        self.pretrained_load_info: Dict[str, Any] = {
+            "driver_loader_enabled": bool(self.kwargs.get("load_external_pretrained_in_driver", False)),
+        }
+        if self._should_use_module_pretrained_loader():
+            self._maybe_load_pretrained_separator()
+            self._maybe_load_pretrained_guide_encoder()
+        else:
+            self.pretrained_load_info["module_loader_skipped"] = True
 
         # ------------------------------------------------------------------
         # Runtime buffers / accumulators
@@ -431,6 +447,9 @@ class ssmodule_sep(pl.LightningModule):
         return ckpt  # raw state_dict case
 
     def _maybe_load_pretrained_separator(self) -> None:
+        if not self._should_use_module_pretrained_loader():
+            return
+
         ckpt_path = self.kwargs.get("pretrained_sep_ckpt", None)
         if not ckpt_path:
             return
@@ -452,6 +471,9 @@ class ssmodule_sep(pl.LightningModule):
         self.pretrained_load_info["separator"] = load_info
 
     def _maybe_load_pretrained_guide_encoder(self) -> None:
+        if not self._should_use_module_pretrained_loader():
+            return
+
         if self.guide_encoder is None:
             return
 
