@@ -446,6 +446,59 @@ class ssmodule_sep(pl.LightningModule):
                 return value
         return ckpt  # raw state_dict case
 
+    @staticmethod
+    def _default_pretrained_sep_strip_prefixes() -> Tuple[str, ...]:
+        return (
+            "module.model.",
+            "model.separator.",
+            "module.separator.",
+            "model.base.",
+            "module.base.",
+            "model.ss_model.separator.",
+            "model.ss_model.base.",
+            "model.ss_model.",
+            "module.ss_model.",
+            "net.separator.",
+            "module.backbone.",
+            "separator.",
+            "backbone.",
+            "base.",
+            "ss_model.",
+            "model.",
+            "module.",
+        )
+
+    @staticmethod
+    def _strip_repeated_prefixes_from_key(key: str, prefixes: Sequence[str]) -> str:
+        ordered = tuple(sorted(set(prefixes), key=len, reverse=True))
+        out = key
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ordered:
+                if out.startswith(prefix):
+                    out = out[len(prefix):]
+                    changed = True
+                    break
+        return out
+
+    @classmethod
+    def _strip_repeated_prefixes_from_state_dict(
+        cls,
+        state_dict: Mapping[str, Any],
+        prefixes: Sequence[str],
+    ) -> Tuple[Dict[str, Any], List[Tuple[str, str]]]:
+        normalized: Dict[str, Any] = {}
+        collisions: List[Tuple[str, str]] = []
+
+        for key, value in state_dict.items():
+            new_key = cls._strip_repeated_prefixes_from_key(str(key), prefixes)
+            if new_key in normalized and normalized[new_key] is not value:
+                collisions.append((str(key), new_key))
+            normalized[new_key] = value
+
+        return normalized, collisions
+
     def _maybe_load_pretrained_separator(self) -> None:
         if not self._should_use_module_pretrained_loader():
             return
@@ -455,19 +508,29 @@ class ssmodule_sep(pl.LightningModule):
             return
 
         ckpt = self._load_checkpoint_payload(ckpt_path)
-        state_dict = self._extract_state_dict_from_checkpoint(ckpt)
+        raw_state_dict = self._extract_state_dict_from_checkpoint(ckpt)
+        strip_prefixes = tuple(
+            self.kwargs.get(
+                "pretrained_sep_strip_prefixes",
+                self._default_pretrained_sep_strip_prefixes(),
+            )
+        )
+        normalized_state_dict, collisions = self._strip_repeated_prefixes_from_state_dict(
+            raw_state_dict,
+            strip_prefixes,
+        )
+
         base_separator = self._unwrap_base_separator()
         load_info = base_separator.load_pretrained_separator_state_dict(
-            state_dict=state_dict,
+            state_dict=normalized_state_dict,
             strict_backbone=bool(self.kwargs.get("pretrained_sep_strict_backbone", False)),
-            strip_prefixes=tuple(
-                self.kwargs.get(
-                    "pretrained_sep_strip_prefixes",
-                    ("separator.", "model.separator.", "module.separator.", "module."),
-                )
-            ),
+            strip_prefixes=(),
         )
         load_info["checkpoint_path"] = str(ckpt_path)
+        load_info["strip_prefixes"] = list(strip_prefixes)
+        load_info["prefix_collision_count"] = len(collisions)
+        if collisions:
+            load_info["prefix_collision_examples"] = collisions[:10]
         self.pretrained_load_info["separator"] = load_info
 
     def _maybe_load_pretrained_guide_encoder(self) -> None:

@@ -549,15 +549,262 @@ class ResUNetSeparator(nn.Module):
         new_shape = (reduce_source.shape[0], target_in, group_size, *reduce_source.shape[2:])
         return reduce_source.reshape(new_shape).mean(dim=2)
 
+    @staticmethod
+    def _strip_repeated_prefixes_from_key(
+        key: str,
+        prefixes: Iterable[str],
+    ) -> str:
+        ordered = tuple(sorted(set(str(p) for p in prefixes if p), key=len, reverse=True))
+        out = str(key)
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ordered:
+                if out.startswith(prefix):
+                    out = out[len(prefix) :]
+                    changed = True
+                    break
+        return out
+
+    @staticmethod
+    def _shape_is_compatible(
+        source: torch.Tensor,
+        target: torch.Tensor,
+    ) -> bool:
+        if tuple(source.shape) == tuple(target.shape):
+            return True
+        adapted = ResUNetSeparator._adapt_input_channel_weight(source, target.shape)
+        return adapted is not None and tuple(adapted.shape) == tuple(target.shape)
+
+    @staticmethod
+    def _remap_audiosep_param_suffix(
+        suffix: str,
+        *,
+        target_kind: str,
+    ) -> List[str]:
+        out: List[str] = []
+        if target_kind == "residual":
+            mapping = {
+                "conv_block1.conv1.": "conv1.",
+                "conv_block1.bn1.": "norm1.",
+                "conv_block1.conv2.": "conv2.",
+                "conv_block1.bn2.": "norm2.",
+                "conv_block1.shortcut.weight": "skip.0.weight",
+                "conv_block1.shortcut.bias": "skip.0.bias",
+            }
+            for src, dst in mapping.items():
+                if suffix.startswith(src):
+                    out.append(dst + suffix[len(src) :])
+            if suffix.startswith("conv_block1.shortcut."):
+                out.append("skip.1." + suffix[len("conv_block1.shortcut.") :])
+        elif target_kind == "convnormact":
+            mapping = {
+                "conv_block1.conv1.": "conv.",
+                "conv_block1.bn1.": "norm.",
+                "conv_block1.shortcut.weight": "conv.weight",
+                "conv_block1.shortcut.bias": "conv.bias",
+            }
+            for src, dst in mapping.items():
+                if suffix.startswith(src):
+                    out.append(dst + suffix[len(src) :])
+        return out
+
+    def _find_unique_shape_compatible_match(
+        self,
+        own_state: Mapping[str, torch.Tensor],
+        value: torch.Tensor,
+        *,
+        preferred_prefixes: Sequence[str] = (),
+        preferred_suffixes: Sequence[str] = (),
+    ) -> Optional[str]:
+        candidates: List[str] = []
+        for key, target in own_state.items():
+            if preferred_prefixes and not any(key.startswith(prefix) for prefix in preferred_prefixes):
+                continue
+            if preferred_suffixes and not any(key.endswith(suffix) for suffix in preferred_suffixes):
+                continue
+            if self._shape_is_compatible(value, target):
+                candidates.append(key)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _candidate_remap_keys(
+        self,
+        normalized_key: str,
+        own_state: Mapping[str, torch.Tensor],
+        value: torch.Tensor,
+    ) -> List[str]:
+        candidates: List[str] = []
+
+        def add(*keys: str) -> None:
+            for key in keys:
+                if key and key not in candidates:
+                    candidates.append(key)
+
+        # Exact match first.
+        add(normalized_key)
+
+        # Ignore clearly non-backbone / frontend / guide keys.
+        ignore_prefixes = (
+            "stft.",
+            "istft.",
+            "bn0.",
+            "bn0_fb.",
+            "soundbeam_",
+            "weight_x_center",
+            "weight_soundbeam_features",
+            "embedding_model.",
+            "label_embedding.",
+            "time_embedding.",
+        )
+        if normalized_key.startswith(ignore_prefixes) or normalized_key in {"soundbeam_weights"}:
+            return candidates
+
+        if normalized_key.startswith("pre_conv."):
+            suffix = normalized_key[len("pre_conv.") :]
+            add(f"stem.conv.{suffix}")
+            return candidates
+
+        # Morocutti / AudioSep encoder blocks -> current encoder residual blocks.
+        encoder_block_to_prefixes: Dict[int, Tuple[str, ...]] = {
+            1: ("encoder.0.net.0.",),
+            2: ("encoder.0.net.1.",),
+            3: ("encoder.1.net.1.",),
+            4: ("encoder.1.net.2.",),
+            5: ("encoder.2.net.1.",),
+            6: ("encoder.2.net.2.",),
+        }
+        decoder_block_to_prefixes: Dict[int, Tuple[str, ...]] = {
+            1: ("decoder.0.fuse.",),
+            2: ("decoder.0.res_blocks.0.",),
+            3: ("decoder.0.res_blocks.1.",),
+            4: ("decoder.1.fuse.",),
+            5: ("decoder.1.res_blocks.0.",),
+            6: ("decoder.1.res_blocks.1.",),
+        }
+        bottleneck_to_prefixes: Dict[str, Tuple[str, ...]] = {
+            "conv_block7a": ("bottleneck.blocks.0.", "pre_bottleneck."),
+            "conv_block7b": ("bottleneck.blocks.1.", "pre_bottleneck."),
+        }
+
+        import re
+
+        enc_match = re.match(r"encoder_block(\d+)\.(.+)", normalized_key)
+        if enc_match:
+            block_idx = int(enc_match.group(1))
+            suffix = enc_match.group(2)
+            target_prefixes = encoder_block_to_prefixes.get(block_idx, ())
+            for target_prefix in target_prefixes:
+                for remapped_suffix in self._remap_audiosep_param_suffix(suffix, target_kind="residual"):
+                    add(target_prefix + remapped_suffix)
+            if not any(key in own_state for key in candidates[1:]):
+                suffix_candidates = tuple(
+                    remapped_suffix
+                    for remapped_suffix in self._remap_audiosep_param_suffix(suffix, target_kind="residual")
+                )
+                match = self._find_unique_shape_compatible_match(
+                    own_state,
+                    value,
+                    preferred_prefixes=target_prefixes,
+                    preferred_suffixes=suffix_candidates,
+                )
+                if match is not None:
+                    add(match)
+            return candidates
+
+        dec_match = re.match(r"decoder_block(\d+)\.(.+)", normalized_key)
+        if dec_match:
+            block_idx = int(dec_match.group(1))
+            suffix = dec_match.group(2)
+            target_prefixes = decoder_block_to_prefixes.get(block_idx, ())
+            target_kind = "convnormact" if block_idx in {1, 4} else "residual"
+            for target_prefix in target_prefixes:
+                for remapped_suffix in self._remap_audiosep_param_suffix(suffix, target_kind=target_kind):
+                    add(target_prefix + remapped_suffix)
+            if not any(key in own_state for key in candidates[1:]):
+                suffix_candidates = tuple(
+                    remapped_suffix
+                    for remapped_suffix in self._remap_audiosep_param_suffix(suffix, target_kind=target_kind)
+                )
+                match = self._find_unique_shape_compatible_match(
+                    own_state,
+                    value,
+                    preferred_prefixes=target_prefixes,
+                    preferred_suffixes=suffix_candidates,
+                )
+                if match is not None:
+                    add(match)
+            return candidates
+
+        bottleneck_match = re.match(r"(conv_block7[a-z])\.(.+)", normalized_key)
+        if bottleneck_match:
+            block_name = bottleneck_match.group(1)
+            suffix = bottleneck_match.group(2)
+            target_prefixes = bottleneck_to_prefixes.get(block_name, ())
+            for target_prefix in target_prefixes:
+                target_kind = "residual" if target_prefix.startswith("bottleneck") else "convnormact"
+                for remapped_suffix in self._remap_audiosep_param_suffix(suffix, target_kind=target_kind):
+                    add(target_prefix + remapped_suffix)
+            return candidates
+
+        if normalized_key.startswith("DPRNN."):
+            add("dprnn." + normalized_key[len("DPRNN.") :])
+            return candidates
+
+        if normalized_key.startswith("time_film."):
+            suffix = normalized_key[len("time_film.") :]
+            for prefix in ("bottleneck_time_film.", "decoder_time_film.0.", "decoder_time_film.1."):
+                add(prefix + suffix)
+            match = self._find_unique_shape_compatible_match(
+                own_state,
+                value,
+                preferred_prefixes=("bottleneck_time_film.", "decoder_time_film.0.", "decoder_time_film.1."),
+                preferred_suffixes=(suffix, ".".join(suffix.split(".")[-2:]), suffix.split(".")[-1]),
+            )
+            if match is not None:
+                add(match)
+            return candidates
+
+        if normalized_key.startswith("film."):
+            # Current lightweight separator does not expose the original AudioSep
+            # clip-level FiLM module naming. Keep exact/fuzzy candidates only when
+            # a same-name module exists in a future version.
+            suffix = normalized_key[len("film.") :]
+            match = self._find_unique_shape_compatible_match(
+                own_state,
+                value,
+                preferred_prefixes=("bottleneck_time_film.", "decoder_time_film.0.", "decoder_time_film.1."),
+                preferred_suffixes=(suffix, ".".join(suffix.split(".")[-2:]), suffix.split(".")[-1]),
+            )
+            if match is not None:
+                add(match)
+            return candidates
+
+        return candidates
+
     def load_pretrained_separator_state_dict(
         self,
         state_dict: Mapping[str, torch.Tensor],
         *,
         strict_backbone: bool = False,
         strip_prefixes: Iterable[str] = (
-            "separator.",
+            "module.model.",
             "model.separator.",
             "module.separator.",
+            "model.base.",
+            "module.base.",
+            "model.ss_model.separator.",
+            "model.ss_model.base.",
+            "model.ss_model.",
+            "module.ss_model.",
+            "net.separator.",
+            "module.backbone.",
+            "separator.",
+            "backbone.",
+            "base.",
+            "ss_model.",
+            "model.",
             "module.",
         ),
     ) -> Dict[str, Any]:
@@ -570,22 +817,11 @@ class ResUNetSeparator(nn.Module):
         1. match the expected tensor shape exactly, or
         2. can be adapted by reducing only the input-channel dimension.
 
-        The second path is important for transferring Morocutti-style separator
-        checkpoints trained with 4 input channels into this mono ASD backbone,
-        while still keeping the no-pretrained baseline completely unchanged.
-
-        Parameters
-        ----------
-        state_dict:
-            Raw state dict from an external checkpoint, or the ``state_dict``
-            field already extracted from one.
-        strict_backbone:
-            If ``True``, call ``load_state_dict(..., strict=True)`` on the
-            filtered backbone keys. In practice ``False`` is recommended for the
-            first AudioSep transfer attempt.
-        strip_prefixes:
-            Candidate key prefixes to remove before matching against the current
-            separator keys.
+        In addition to exact-name matching, it also includes a small importer
+        for Morocutti/AudioSep-style checkpoint names (e.g. ``pre_conv``,
+        ``encoder_block*``, ``decoder_block*``, ``conv_block7*``, ``DPRNN``).
+        This keeps the baseline path unchanged when pretrained loading is off,
+        while making partial reuse of external separator checkpoints possible.
         """
 
         if not isinstance(state_dict, Mapping):
@@ -596,20 +832,21 @@ class ResUNetSeparator(nn.Module):
         unexpected_source_keys: List[str] = []
         skipped_shape_keys: List[str] = []
         adapted_shape_keys: List[str] = []
+        remapped_source_keys: List[str] = []
 
         for raw_key, value in state_dict.items():
             if not torch.is_tensor(value):
                 continue
 
-            candidate_keys = [raw_key]
-            for prefix in strip_prefixes:
-                if raw_key.startswith(prefix):
-                    candidate_keys.append(raw_key[len(prefix) :])
+            normalized_key = self._strip_repeated_prefixes_from_key(raw_key, strip_prefixes)
+            candidate_keys = self._candidate_remap_keys(normalized_key, own_state, value)
 
             matched_key: Optional[str] = None
+            was_remapped = False
             for key in candidate_keys:
                 if key in own_state:
                     matched_key = key
+                    was_remapped = key != normalized_key
                     break
 
             if matched_key is None:
@@ -618,13 +855,17 @@ class ResUNetSeparator(nn.Module):
 
             target_tensor = own_state[matched_key]
             if tuple(value.shape) == tuple(target_tensor.shape):
-                normalized_state[matched_key] = value
+                normalized_state[matched_key] = value.to(dtype=target_tensor.dtype)
+                if was_remapped:
+                    remapped_source_keys.append(raw_key)
                 continue
 
             adapted_value = self._adapt_input_channel_weight(value, target_tensor.shape)
             if adapted_value is not None and tuple(adapted_value.shape) == tuple(target_tensor.shape):
                 normalized_state[matched_key] = adapted_value.to(dtype=target_tensor.dtype)
                 adapted_shape_keys.append(raw_key)
+                if was_remapped:
+                    remapped_source_keys.append(raw_key)
                 continue
 
             skipped_shape_keys.append(raw_key)
@@ -633,12 +874,14 @@ class ResUNetSeparator(nn.Module):
         return {
             "num_loaded_tensors": len(normalized_state),
             "num_adapted_tensors": len(adapted_shape_keys),
+            "num_remapped_tensors": len(remapped_source_keys),
             "loaded_keys": sorted(normalized_state.keys()),
             "missing_keys": list(incompatible.missing_keys),
             "unexpected_keys": list(incompatible.unexpected_keys),
             "unexpected_source_keys": unexpected_source_keys,
             "skipped_shape_keys": skipped_shape_keys,
             "adapted_shape_keys": adapted_shape_keys,
+            "remapped_source_keys": remapped_source_keys,
         }
 
 
